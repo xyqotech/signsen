@@ -99,6 +99,20 @@ Owners (senders) have accounts: e-mail + password (scrypt), sessions in
 httpOnly cookies (random token, hashed at rest). Recipients never need an
 account.
 
+Forgotten password: the sign-in page links to a form asking for the account's
+e-mail address. The answer is the same whether an account exists or not, and
+the e-mail is sent without making the answer wait for it. An existing account
+receives a personal link with a random 256-bit token (only its SHA-256 is
+stored), valid 1 hour and usable once; a new request replaces the previous
+link. At most 3 requests per address per hour, and `SIGNIN_IP_LIMIT` per IP
+address per hour. Choosing the new password (same rules as at sign-up) spends
+the link, closes every session of the account and e-mails the owner that the
+password changed. A short password does not spend the link.
+
+The data directory and its sub-folders are created `0700`; the SQLite database
+and its `-wal`/`-shm` files `0600`, whatever the process umask. Files left
+readable by others by an earlier version are tightened at start-up.
+
 ## 9. Personalisation (white label)
 
 Name, logo, primary colour, default language and support e-mail come from

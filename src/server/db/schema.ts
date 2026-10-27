@@ -30,6 +30,21 @@ export const sessions = sqliteTable("sessions", {
   expiresAt: integer("expires_at").notNull(),
 });
 
+/** Single-use password reset links; only the SHA-256 of the token is stored. */
+export const passwordResets = sqliteTable(
+  "password_resets",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    tokenHash: text("token_hash").notNull().unique(),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+  },
+  (t) => [index("password_resets_user_idx").on(t.userId)],
+);
+
 /** Content-addressed blobs; the bytes live on disk under DATA_DIR/files. */
 export const files = sqliteTable("files", {
   sha256: text("sha256").primaryKey(),

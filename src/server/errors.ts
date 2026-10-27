@@ -8,6 +8,7 @@ export type ErrorCode =
   | "invalid_credentials"
   | "signup_disabled"
   | "rate_limited"
+  | "reset_link_invalid"
   | "invalid_pdf"
   | "pdf_encrypted"
   | "pdf_too_large"

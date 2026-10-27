@@ -19,8 +19,22 @@ export class FileIntegrityError extends Error {
   }
 }
 
+/**
+ * Creates a folder readable only by its owner, and tightens one that already
+ * exists (an operator may have created DATA_DIR before the first start).
+ */
+export function privateDir(dir: string) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch (e) {
+    // A mounted folder owned by someone else: its files stay 0600 anyway.
+    console.warn(`Could not restrict ${dir} to its owner: ${(e as Error).message}`);
+  }
+}
+
 export function createFileStore(db: Db, dir: string, now: () => number): FileStore {
-  fs.mkdirSync(dir, { recursive: true });
+  privateDir(dir);
 
   const locate = (sha256: string) => {
     if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error("Invalid file id");
@@ -32,7 +46,7 @@ export function createFileStore(db: Db, dir: string, now: () => number): FileSto
       const sha256 = sha256Hex(bytes);
       const target = locate(sha256);
       if (!fs.existsSync(target)) {
-        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
         const tmp = `${target}.${randomBytes(6).toString("hex")}.tmp`;
         fs.writeFileSync(tmp, bytes, { mode: 0o600 });
         fs.renameSync(tmp, target);

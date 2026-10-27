@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { appendEvent, GENESIS_HASH, listEvents, verifyChain } from "./audit";
@@ -13,7 +14,9 @@ import {
   verifyPassword,
 } from "./crypto";
 import { FileIntegrityError } from "./files";
+import { MemoryMailer } from "./mail";
 import { consumeRate } from "./ratelimit";
+import { createServices } from "./services";
 import { makeTestServices, type TestKit } from "./testing";
 
 describe("parseConfig", () => {
@@ -189,5 +192,47 @@ describe("instance secrets", () => {
     expect(seal.fingerprint).toMatch(/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/);
     expect(fs.statSync(path.join(k.s.config.dataDir, "seal", "seal.p12")).mode & 0o077).toBe(0);
     expect(k.s.sealIdentity().fingerprint).toBe(seal.fingerprint);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("data directory permissions", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  const privateMode = (file: string) => fs.statSync(file).mode & 0o077;
+  const open = (dir: string) => createServices(parseConfig({ DATA_DIR: dir, MAIL_TRANSPORT: "console" }), { mailer: new MemoryMailer() });
+
+  it("creates the database, its WAL files and the data folders readable only by their owner", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "signsen-perm-"));
+    dirs.push(dir);
+    fs.chmodSync(dir, 0o755); // as an operator would create it, before the first start
+    const s = open(dir);
+    try {
+      s.files.put(Buffer.from("%PDF-1.7 x"), "application/pdf");
+      for (const name of ["signsen.db", "signsen.db-wal", "signsen.db-shm"]) {
+        expect(privateMode(path.join(dir, name)), name).toBe(0);
+      }
+      expect(privateMode(dir)).toBe(0);
+      expect(privateMode(path.join(dir, "files"))).toBe(0);
+    } finally {
+      s.sqlite.close();
+    }
+  });
+
+  it("tightens a database left world-readable by an earlier version", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "signsen-perm-"));
+    dirs.push(dir);
+    open(dir).sqlite.close();
+    fs.chmodSync(path.join(dir, "signsen.db"), 0o644);
+    const s = open(dir);
+    try {
+      for (const name of ["signsen.db", "signsen.db-wal", "signsen.db-shm"]) {
+        expect(privateMode(path.join(dir, name)), name).toBe(0);
+      }
+    } finally {
+      s.sqlite.close();
+    }
   });
 });

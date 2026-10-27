@@ -17,6 +17,8 @@ to you unless you prefer otherwise.
 | A sender reads another sender's requests | Every read and write checks ownership and answers "not found"; `proxy.ts` returns a real 404 before rendering. |
 | Signing links leak to third parties | `Referrer-Policy: no-referrer`, `Cache-Control: no-store` on signing pages, links rotate when an invitation is resent. |
 | Password guessing | scrypt hashes, throttling per account and per IP, identical answers for unknown accounts and wrong passwords. |
+| Account takeover through "forgot password" | Single-use 256-bit link (only its SHA-256 is stored), valid 1 hour, replaced by any newer request; same answer for unknown addresses; 3 requests per address per hour; a reset closes every session and e-mails the owner. |
+| Another account on the server reads the data | `DATA_DIR` and its folders are `0700`; the database, its `-wal`/`-shm` files, documents, seal and instance key are `0600`, whatever the umask. |
 | Clickjacking, MIME sniffing | `frame-ancestors 'none'`, `X-Frame-Options: DENY`, `nosniff`. |
 | CSRF | Server Actions check the request origin; session cookie is `SameSite=Lax`, `HttpOnly`, `Secure` over HTTPS. |
 
@@ -26,8 +28,9 @@ to you unless you prefer otherwise.
   `X-Forwarded-For` (the evidence file records the right-most entry).
 - **Back up `DATA_DIR`** (database, documents, seal, instance key) and keep the
   backups encrypted: they contain personal data and signed documents.
-- Keep `seal/` and `instance.key` readable by the service account only (they are
-  created with mode `0600`).
+- Keep `DATA_DIR` readable by the service account only. SignSen creates and
+  tightens it (`0700`, files `0600`), but cannot do so on a folder it does not
+  own: it then logs a warning.
 - Comply with the data-protection law that applies to you (retention, purpose,
   information of signers, transfers abroad).
 

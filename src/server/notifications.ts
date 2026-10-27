@@ -17,6 +17,32 @@ function footer(brand: Brand, locale: Locale) {
     : `\n\n—\n${brand.name}. This message is automatic.${support}`;
 }
 
+export function passwordResetMail(p: { to: string; locale: Locale; brand: Brand; name: string; link: string }): MailMessage {
+  const fr = p.locale === "fr";
+  return {
+    to: p.to,
+    subject: fr ? "Réinitialiser votre mot de passe" : "Reset your password",
+    text:
+      (fr
+        ? `Bonjour ${p.name},\n\nPour choisir un nouveau mot de passe, ouvrez ce lien :\n${p.link}\n\nIl est valable 1 heure et ne sert qu'une fois. Si vous n'avez rien demandé, ignorez ce message : votre mot de passe reste inchangé.`
+        : `Hello ${p.name},\n\nTo choose a new password, open this link:\n${p.link}\n\nIt is valid for 1 hour and works only once. If you did not ask for it, ignore this message: your password stays the same.`) +
+      footer(p.brand, p.locale),
+  };
+}
+
+export function passwordChangedMail(p: { to: string; locale: Locale; brand: Brand; name: string; forgotLink: string }): MailMessage {
+  const fr = p.locale === "fr";
+  return {
+    to: p.to,
+    subject: fr ? "Votre mot de passe a été modifié" : "Your password was changed",
+    text:
+      (fr
+        ? `Bonjour ${p.name},\n\nLe mot de passe de votre compte ${p.brand.name} vient d'être modifié, et toutes vos sessions ont été fermées.\n\nSi vous n'êtes pas à l'origine de ce changement, choisissez tout de suite un nouveau mot de passe :\n${p.forgotLink}`
+        : `Hello ${p.name},\n\nThe password of your ${p.brand.name} account was just changed, and all your sessions were closed.\n\nIf you did not make this change, choose a new password right away:\n${p.forgotLink}`) +
+      footer(p.brand, p.locale),
+  };
+}
+
 export function invitationMail(p: {
   to: string;
   locale: Locale;
