@@ -7,7 +7,7 @@
     "node": ">=20.9"
   },
   "scripts": {
-    "copy:pdf-worker": "node -e \"require('fs').copyFileSync('node_modules/pdfjs-dist/build/pdf.worker.min.mjs','public/pdf.worker.min.mjs')\"",
+    "copy:pdf-worker": "node -e \"const fs=require('fs');fs.mkdirSync('public',{recursive:true});fs.copyFileSync('node_modules/pdfjs-dist/build/pdf.worker.min.mjs','public/pdf.worker.min.mjs')\"",
     "predev": "npm run copy:pdf-worker",
     "prebuild": "npm run copy:pdf-worker",
     "dev": "next dev",
