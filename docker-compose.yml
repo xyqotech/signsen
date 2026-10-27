@@ -1,0 +1,15 @@
+# SignSen behind your reverse proxy (Caddy, Nginx, Traefik…) which terminates TLS
+# and sets X-Forwarded-For. Copy .env.example to .env and edit it first.
+services:
+  signsen:
+    build: .
+    image: signsen:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - signsen-data:/data
+
+volumes:
+  signsen-data:

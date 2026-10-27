@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+data
+e2e/.data
+test-results
+playwright-report
+coverage
+.env*
+!.env.example
+*.p12
+public/pdf.worker.min.mjs
