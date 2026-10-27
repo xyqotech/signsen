@@ -51,6 +51,12 @@ export class Mailbox {
     return mail.text.match(/https?:\/\/\S+\/s\/[A-Za-z0-9_-]{43}/)![0];
   }
 
+  /** The password reset link of the latest reset e-mail sent to this address. */
+  async resetLink(address: string): Promise<string> {
+    const mail = await this.waitFor(address, (m) => /\/reset\/[A-Za-z0-9_-]{43}/.test(m.text));
+    return mail.text.match(/https?:\/\/\S+\/reset\/[A-Za-z0-9_-]{43}/)![0];
+  }
+
   /** Waits for a one-time code mailed after `after` messages, and returns it. */
   async nextCode(address: string, after: number): Promise<string> {
     const mail = await this.waitFor(address, (m) => /^(Votre code|Your code)/.test(m.subject), { after });

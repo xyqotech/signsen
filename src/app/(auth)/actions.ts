@@ -1,8 +1,16 @@
 "use server";
 
 import { redirect } from "next/navigation";
-import { signIn, signUp } from "@/server/auth";
-import { actionError, currentLocale, requestMeta, services, setSessionCookie, type ActionState } from "@/server/request";
+import { requestPasswordReset, resetPassword, signIn, signUp } from "@/server/auth";
+import {
+  actionError,
+  clearSessionCookie,
+  currentLocale,
+  requestMeta,
+  services,
+  setSessionCookie,
+  type ActionState,
+} from "@/server/request";
 
 export async function loginAction(_prev: unknown, formData: FormData): Promise<ActionState> {
   const s = await services();
@@ -31,4 +39,27 @@ export async function signupAction(_prev: unknown, formData: FormData): Promise<
     return actionError(e);
   }
   redirect("/envelopes");
+}
+
+export async function forgotPasswordAction(_prev: unknown, formData: FormData): Promise<ActionState> {
+  const s = await services();
+  try {
+    await requestPasswordReset(s, { email: String(formData.get("email") ?? "") }, await requestMeta());
+  } catch (e) {
+    return actionError(e);
+  }
+  return { ok: true };
+}
+
+export async function resetPasswordAction(_prev: unknown, formData: FormData): Promise<ActionState> {
+  const s = await services();
+  try {
+    await resetPassword(s, { token: String(formData.get("token") ?? ""), password: String(formData.get("password") ?? "") });
+  } catch (e) {
+    return actionError(e);
+  }
+  // Every session of the account was just closed, this browser's included. The
+  // link is spent: leave its page, which would now only say so.
+  await clearSessionCookie();
+  redirect("/login?reset=done");
 }

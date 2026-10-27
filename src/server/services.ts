@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import type Database from "better-sqlite3";
 import { parseConfig, type AppConfig } from "./config";
 import { openDatabase, type Db } from "./db/client";
-import { createFileStore, type FileStore } from "./files";
+import { createFileStore, privateDir, type FileStore } from "./files";
 import { createMailer, type Mailer } from "./mail";
 import { loadSealIdentity, type SealIdentity } from "./pdf/seal-identity";
 
@@ -27,7 +27,7 @@ export interface ServiceOverrides {
 }
 
 export function createServices(config: AppConfig, overrides: ServiceOverrides = {}): Services {
-  fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+  privateDir(config.dataDir);
   const now = overrides.now ?? (() => Date.now());
   const { db, sqlite } = openDatabase(path.join(config.dataDir, "signsen.db"));
   let seal: SealIdentity | undefined;

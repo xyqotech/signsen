@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import nodemailer from "nodemailer";
 import type { AppConfig } from "./config";
+import { privateDir } from "./files";
 
 export interface MailAttachment {
   filename: string;
@@ -51,7 +52,7 @@ export function createMailer(config: AppConfig): Mailer {
     case "file": {
       // One JSON file per message: handy in development and for end-to-end tests.
       const dir = path.join(config.dataDir, "outbox");
-      fs.mkdirSync(dir, { recursive: true });
+      privateDir(dir);
       return {
         async send(m) {
           const name = `${Date.now()}-${randomBytes(4).toString("hex")}.json`;

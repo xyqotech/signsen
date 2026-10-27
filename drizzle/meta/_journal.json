@@ -15,6 +15,13 @@
       "when": 1792955538125,
       "tag": "0001_events_append_only",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1793107662401,
+      "tag": "0002_password_resets",
+      "breakpoints": true
     }
   ]
 }

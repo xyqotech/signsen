@@ -1,7 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import QRCode from "qrcode";
 import { listEvents, verifyChain } from "./audit";
-import { SESSION_TTL_MS, signIn, signOut, signUp, userForSession, type PublicUser } from "./auth";
+import {
+  requestPasswordReset,
+  RESET_TTL_MS,
+  resetLinkValid,
+  resetPassword,
+  SESSION_TTL_MS,
+  signIn,
+  signOut,
+  signUp,
+  userForSession,
+  type PublicUser,
+} from "./auth";
 import { act, ceremonyDocument, decline, openCeremony, OTP_TTL_MS, requestCode } from "./ceremony";
 import {
   addRecipient,
@@ -139,6 +150,91 @@ describe("accounts", () => {
       await expectCode(signIn(k.s, { email: "awa@acme.test", password: "wrong password!!" }), "invalid_credentials");
     }
     await expectCode(signIn(k.s, { email: "awa@acme.test", password: "a long password 42" }), "rate_limited");
+  });
+});
+
+describe("password reset", () => {
+  const NEW_PASSWORD = "a brand new passphrase 7";
+
+  function resetLinkFor(email: string): string {
+    const m = k.mailer.last(email)?.text.match(/\/reset\/([A-Za-z0-9_-]{43})/);
+    if (!m) throw new Error(`no reset link for ${email}`);
+    return m[1];
+  }
+
+  it("mails a personal link to a known account and answers the same for an unknown one", async () => {
+    await owner();
+    await requestPasswordReset(k.s, { email: " AWA@acme.test " });
+    const mail = k.mailer.last("awa@acme.test");
+    expect(mail?.subject).toMatch(/mot de passe/i);
+    expect(mail?.text).toContain("http://signsen.test/reset/");
+    expect(mail?.text).toMatch(/1 heure/);
+    expect(resetLinkValid(k.s, resetLinkFor("awa@acme.test"))).toBe(true);
+
+    await expect(requestPasswordReset(k.s, { email: "nobody@acme.test" })).resolves.toBeUndefined();
+    expect(k.mailer.to("nobody@acme.test")).toHaveLength(0);
+  });
+
+  it("changes the password, signs out every session and warns the owner", async () => {
+    await owner();
+    const before = await signIn(k.s, { email: "awa@acme.test", password: "a long password 42" });
+    await requestPasswordReset(k.s, { email: "awa@acme.test" });
+    const token = resetLinkFor("awa@acme.test");
+
+    await resetPassword(k.s, { token, password: NEW_PASSWORD });
+
+    expect(userForSession(k.s, before.token)).toBeNull();
+    await expectCode(signIn(k.s, { email: "awa@acme.test", password: "a long password 42" }), "invalid_credentials");
+    expect((await signIn(k.s, { email: "awa@acme.test", password: NEW_PASSWORD })).user.email).toBe("awa@acme.test");
+    expect(k.mailer.last("awa@acme.test")?.subject).toMatch(/modifié/);
+    expect(resetLinkValid(k.s, token)).toBe(false);
+    await expectCode(resetPassword(k.s, { token, password: "yet another passphrase" }), "reset_link_invalid");
+  });
+
+  it("keeps the link when the new password is too short", async () => {
+    await owner();
+    await requestPasswordReset(k.s, { email: "awa@acme.test" });
+    const token = resetLinkFor("awa@acme.test");
+    await expect(resetPassword(k.s, { token, password: "short" })).rejects.toSatisfy(
+      (e) => isDomainError(e, "validation") && (e.details?.fields as Record<string, string>).password === "too_small",
+    );
+    expect(resetLinkValid(k.s, token)).toBe(true);
+  });
+
+  it("expires after one hour and is replaced by a newer request", async () => {
+    await owner();
+    await requestPasswordReset(k.s, { email: "awa@acme.test" });
+    const first = resetLinkFor("awa@acme.test");
+    await requestPasswordReset(k.s, { email: "awa@acme.test" });
+    const second = resetLinkFor("awa@acme.test");
+    expect(resetLinkValid(k.s, first)).toBe(false);
+    expect(resetLinkValid(k.s, second)).toBe(true);
+
+    k.advance(RESET_TTL_MS + 1);
+    expect(resetLinkValid(k.s, second)).toBe(false);
+    await expectCode(resetPassword(k.s, { token: second, password: NEW_PASSWORD }), "reset_link_invalid");
+  });
+
+  it("refuses unknown links", async () => {
+    expect(resetLinkValid(k.s, "nope")).toBe(false);
+    await expectCode(resetPassword(k.s, { token: "x".repeat(43), password: NEW_PASSWORD }), "reset_link_invalid");
+  });
+
+  it("limits requests per address and per IP address", async () => {
+    await owner();
+    for (let i = 0; i < 3; i++) await requestPasswordReset(k.s, { email: "awa@acme.test" });
+    await expectCode(requestPasswordReset(k.s, { email: "awa@acme.test" }), "rate_limited");
+    expect(k.mailer.to("awa@acme.test").filter((m) => /reset/.test(m.text))).toHaveLength(3);
+
+    const strict = makeTestServices({ SIGNIN_IP_LIMIT: "2" });
+    try {
+      await requestPasswordReset(strict.s, { email: "a@x.test" }, { ip: "198.51.100.7" });
+      await requestPasswordReset(strict.s, { email: "b@x.test" }, { ip: "198.51.100.7" });
+      await expectCode(requestPasswordReset(strict.s, { email: "c@x.test" }, { ip: "198.51.100.7" }), "rate_limited");
+      await requestPasswordReset(strict.s, { email: "c@x.test" }, { ip: "198.51.100.8" });
+    } finally {
+      strict.cleanup();
+    }
   });
 });
 
