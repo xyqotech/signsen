@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PDFDocument } from "pdf-lib";
 import QRCode from "qrcode";
 import { listEvents, verifyChain } from "./audit";
 import {
@@ -29,6 +30,8 @@ import {
   updateEnvelope,
 } from "./envelopes";
 import { isDomainError, type ErrorCode } from "./errors";
+import { checkPdfStructure, PdfStructureError } from "./pdf/structure";
+import { catalogRedefinedAtGeneration1, withOneWrongOffset } from "./pdf/testing";
 import { verifySeal } from "./pdf/verify";
 import { makeTestServices, samplePdf, type TestKit } from "./testing";
 import { maskEmail, publicEnvelope, verifyUpload } from "./verification";
@@ -69,13 +72,14 @@ function codeFor(email: string): string {
 
 const signature = async () => ({ kind: "drawn" as const, png: await QRCode.toBuffer("my signature", { width: 160 }) });
 
-/** Owner + envelope with a 2-page document and the given recipients, signers with one field each. */
+/** Owner + envelope with a document (2 pages unless given) and the given recipients, signers with one field each. */
 async function readyEnvelope(
   people: { name: string; email: string; role?: "signer" | "approver" | "viewer"; routingOrder?: number }[],
+  document?: Buffer,
 ) {
   const u = await owner();
   const env = await createEnvelope(k.s, u.id, { title: "Contrat de prestation", message: "Merci de signer avant vendredi." });
-  await attachDocument(k.s, u.id, env.id, { name: "contrat.pdf", bytes: await samplePdf() });
+  await attachDocument(k.s, u.id, env.id, { name: "contrat.pdf", bytes: document ?? (await samplePdf()) });
   const recipients = [];
   for (const p of people) recipients.push(await addRecipient(k.s, u.id, env.id, { role: "signer", ...p }));
   await setFields(
@@ -683,6 +687,56 @@ describe("declining and cancelling", () => {
     expect(types).toContain("envelope.sealed");
     expect(types).not.toContain("envelope.cancelled");
     expect(k.mailer.to("moussa@example.test").filter((m) => /Annulé/.test(m.subject))).toHaveLength(0);
+    expect((await verifyChain(k.s.db, env.id)).ok).toBe(true);
+  });
+
+  it("completes a request whose document was saved by incremental updates", async () => {
+    // Two catalogs under one object number, the second with generation 1.
+    const { u, env } = await readyEnvelope([{ name: "Moussa", email: "moussa@example.test" }], catalogRedefinedAtGeneration1());
+    await sendEnvelope(k.s, u.id, env.id);
+    await signAs("moussa@example.test");
+    const final = await getEnvelope(k.s, u.id, env.id);
+    expect(final.status).toBe("completed");
+    const sealed = k.s.files.get(final.finalSha256!);
+    expect(checkPdfStructure(sealed)).toEqual([]);
+    expect(verifySeal(sealed)).toMatchObject({ valid: true });
+    expect(k.mailer.to("moussa@example.test").filter((m) => /Terminé/.test(m.subject))).toHaveLength(1);
+  });
+
+  it("neither seals nor sends a final PDF whose structure is invalid, and leaves the request in progress", async () => {
+    const { u, env } = await readyEnvelope([{ name: "Moussa", email: "moussa@example.test" }]);
+    await sendEnvelope(k.s, u.id, env.id);
+    const token = linkFor("moussa@example.test");
+    await requestCode(k.s, token);
+    const code = codeFor("moussa@example.test");
+    const sig = await signature();
+    // The PDF library writes a cross-reference table with one wrong row.
+    const save = PDFDocument.prototype.save;
+    const broken = vi.spyOn(PDFDocument.prototype, "save").mockImplementation(async function (this: PDFDocument, options) {
+      return withOneWrongOffset(await save.call(this, options));
+    });
+    try {
+      // The signature is recorded, then completion fails: signed by everyone, still in progress.
+      await expect(act(k.s, token, { code, consent: true, signature: sig })).rejects.toBeInstanceOf(PdfStructureError);
+      expect(await getEnvelope(k.s, u.id, env.id)).toMatchObject({ status: "in_progress", finalSha256: null });
+      const types = (await listEvents(k.s.db, env.id)).map((e) => e.type);
+      expect(types).toContain("recipient.signed");
+      expect(types).not.toContain("envelope.completed");
+      expect(types).not.toContain("envelope.sealed");
+      expect(k.mailer.messages.filter((m) => /Terminé/.test(m.subject))).toHaveLength(0);
+
+      // Trying again gives the same refusal: the sender's cancellation is refused and nothing is sealed.
+      await expectCode(cancelEnvelope(k.s, u.id, env.id), "invalid_state");
+      expect(await getEnvelope(k.s, u.id, env.id)).toMatchObject({ status: "in_progress", finalSha256: null });
+    } finally {
+      broken.mockRestore();
+    }
+
+    // Once the file can be written correctly, the next attempt seals it.
+    await expectCode(cancelEnvelope(k.s, u.id, env.id), "invalid_state");
+    const final = await getEnvelope(k.s, u.id, env.id);
+    expect(final.status).toBe("completed");
+    expect(checkPdfStructure(k.s.files.get(final.finalSha256!))).toEqual([]);
     expect((await verifyChain(k.s.db, env.id)).ok).toBe(true);
   });
 

@@ -105,6 +105,19 @@ When the last signer/approver acts:
 4. The SHA-256 of the sealed PDF is recorded.
 5. Every recipient and the owner receive the final document.
 
+Rules:
+- A document saved by incremental updates may hold several objects with the
+  same number (a number freed, then used again with a higher generation).
+  Only the one in use goes into the final PDF, so that its cross-reference
+  table lists each object number once.
+- A final PDF whose structure is invalid is never sealed nor sent. Before the
+  seal, the file is checked without the library that wrote it: every in-use
+  entry of the cross-reference table points at the object with that number
+  and generation, no object number is listed twice, `/Size` matches the table
+  and `/Root` resolves to the catalog. When the check fails, completion fails
+  like a seal that failed (section 3): the signatures stay recorded and the
+  envelope stays in progress.
+
 ## 6. Audit trail
 
 Append-only `events` table. Each event stores the SHA-256 of the previous
