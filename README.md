@@ -70,7 +70,7 @@ code stays `200` even when the database is down.
 Every commit on `main` that passes the tests is built, started once against an
 empty database, and only then published to
 [`ghcr.io/xyqotech/signsen`](https://github.com/xyqotech/signsen/pkgs/container/signsen)
-(`linux/amd64`):
+(`linux/amd64` and `linux/arm64`, under the same tags):
 
 | Tag | Points to |
 | --- | --- |
@@ -255,8 +255,9 @@ le port 3000.
 
 **Image publiée** : chaque commit de `main` qui passe les tests est construit,
 démarré une fois sur une base vide, puis publié sur `ghcr.io/xyqotech/signsen`
-(`linux/amd64`). Déployez une étiquette `sha-<commit>` ou de version, jamais
-`main` ni `latest`, qui changent de contenu d'un jour à l'autre.
+(`linux/amd64` et `linux/arm64`, sous les mêmes étiquettes). Déployez une
+étiquette `sha-<commit>` ou de version, jamais `main` ni `latest`, qui changent
+de contenu d'un jour à l'autre.
 
 **Stockage et sauvegarde** : les comptes, demandes, destinataires et le journal
 d'audit sont dans PostgreSQL (volume `signsen-db`) ; les documents, le sceau et

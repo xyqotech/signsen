@@ -50,17 +50,31 @@ jobs:
           path: playwright-report
           retention-days: 7
 
-  # The container image. It is built and started on every run, so a Dockerfile
-  # that no longer builds, or an image that no longer boots, fails the pull
-  # request. It is published to ghcr.io only from main and from version tags,
-  # and only after the tests above have passed.
+  # The container image, for linux/amd64 and linux/arm64.
+  #
+  # The standalone output embeds a native binary (sharp), so an architecture
+  # cannot be cross-built from the other: each one is built on a runner of its
+  # own architecture. Each image is started on every run, so a Dockerfile that
+  # no longer builds, or an image that no longer boots, fails the pull request.
+  #
+  # Publishing happens only from main and from version tags, and only after the
+  # tests above have passed: each architecture is pushed by digest here, then
+  # the publish job below gathers both under the same tags.
   image:
     needs: test
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     permissions:
       contents: read
-      # Only this job may write packages, and only to push the image.
+      # Only the image jobs may write packages, and only to push the image.
       packages: write
     services:
       postgres:
@@ -78,28 +92,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-      - id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          # main        → :main and :sha-<commit>
-          # tag v1.2.3  → :1.2.3, :1.2, :sha-<commit> and :latest
-          tags: |
-            type=ref,event=branch
-            type=sha
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-
-      # linux/amd64 only for now: the standalone output embeds a native binary
-      # (sharp), so another architecture needs its own build, not a cross-build.
       - name: Build the image
         uses: docker/build-push-action@v7
         with:
           context: .
           load: true
           tags: signsen:candidate
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
 
       # Nothing is published before it has been seen running: the image must
       # start, migrate an empty database and answer /healthz.
@@ -118,20 +118,83 @@ jobs:
           exit 1
       - name: Check the image does not run as root
         run: test "$(docker inspect --format '{{.Config.User}}' signsen:candidate)" = "node"
+      - name: Check the image is built for this architecture
+        run: test "$(docker inspect --format '{{.Architecture}}' signsen:candidate)" = "${{ matrix.arch }}"
 
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
       - if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # Same build as above, served from the cache: what is pushed is what was started.
-      - name: Publish the image
+      # Same build as above, served from the cache: what is pushed is what was
+      # started. Pushed without a tag; the publish job names it.
+      - name: Push the image by digest
+        id: push
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v7
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+      - name: Record the digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.push.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # One name for both architectures: Docker picks the right one on each machine.
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # main        → :main and :sha-<commit>
+          # tag v1.2.3  → :1.2.3, :1.2, :sha-<commit> and :latest
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Gather both architectures under the tags
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # Word splitting is wanted here: one -t per tag, one reference per digest.
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+      - name: Show what was published
+        run: docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}"
