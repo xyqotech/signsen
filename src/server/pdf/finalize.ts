@@ -2,10 +2,11 @@ import { SignPdf } from "@signpdf/signpdf";
 import { P12Signer } from "@signpdf/signer-p12";
 import { pdflibAddPlaceholder } from "@signpdf/placeholder-pdf-lib";
 import { SUBFILTER_ADOBE_PKCS7_DETACHED } from "@signpdf/utils";
-import { degrees, PDFDocument, rgb, StandardFonts, type PDFFont, type PDFPage } from "pdf-lib";
+import { degrees, PDFDocument, rgb, StandardFonts, type PDFFont, type PDFPage, type PDFRef } from "pdf-lib";
 import QRCode from "qrcode";
 import type { Locale } from "../config";
 import type { SealIdentity } from "./seal-identity";
+import { assertPdfStructure } from "./structure";
 
 export interface FinalRecipient {
   id: string;
@@ -415,9 +416,38 @@ async function appendCertificate(doc: PDFDocument, input: FinalizeInput) {
   w.text(t.times, { size: 7, color: [0.45, 0.45, 0.5] });
 }
 
+/**
+ * Leaves one object per object number in the document.
+ *
+ * A PDF saved by incremental updates can hold several: a number that was freed
+ * is used again with a higher generation (ISO 32000-1, 7.5.4) and the bytes of
+ * the old object stay in the file. The PDF library reads the objects one after
+ * the other, without the cross-reference table that tells which is in use, and
+ * keeps them all; when saving, it writes one table row per object on the
+ * assumption that numbers are unique. Every row after a repeated number then
+ * points at the previous object, and readers that trust the table cannot open
+ * the file.
+ *
+ * Only one generation of a number is in use at a time, the latest. The one the
+ * trailer names (catalog, information dictionary) is kept, since it is what
+ * the document was loaded from; otherwise the highest generation is.
+ */
+function dropSupersededObjects(doc: PDFDocument) {
+  const { context } = doc;
+  const named = new Set([context.trailerInfo.Root, context.trailerInfo.Info]);
+  const kept = new Map<number, PDFRef>();
+  for (const [ref] of context.enumerateIndirectObjects()) {
+    const rival = kept.get(ref.objectNumber);
+    const keepRival = rival !== undefined && (named.has(rival) || (!named.has(ref) && rival.generationNumber > ref.generationNumber));
+    if (rival) context.delete(keepRival ? ref : rival);
+    if (!keepRival) kept.set(ref.objectNumber, ref);
+  }
+}
+
 /** Produces the final PDF: stamped signatures + evidence certificate + instance seal. */
 export async function buildFinalPdf(input: FinalizeInput): Promise<Buffer> {
   const doc = await PDFDocument.load(input.original, { updateMetadata: false });
+  dropSupersededObjects(doc);
   const font = await doc.embedFont(StandardFonts.Helvetica);
   await stampSignatures(doc, input, font);
   await appendCertificate(doc, input);
@@ -437,6 +467,8 @@ export async function buildFinalPdf(input: FinalizeInput): Promise<Buffer> {
     appName: input.brandName,
   });
   const unsigned = Buffer.from(await doc.save({ useObjectStreams: false }));
+  // Never seal, then send, a file that readers cannot open (docs/SPEC.md, section 5).
+  assertPdfStructure(unsigned, `Final PDF of ${input.envelope.id}`);
   const signer = new P12Signer(input.seal.p12, { passphrase: input.seal.password });
   return new SignPdf().sign(unsigned, signer, signingTime);
 }
