@@ -142,7 +142,10 @@ export async function updateEnvelope(
   if (!parsed.success) invalid(parsed.error);
   const now = s.now();
   await s.db.transaction(async (tx) => {
-    requireDraft(await ownedEnvelopeForUpdate(tx, ownerId, envelopeId));
+    const env = await ownedEnvelopeForUpdate(tx, ownerId, envelopeId);
+    requireDraft(env);
+    // The editor saves on its own (a field losing focus, sending): no event when nothing changed.
+    if (env.title === parsed.data.title && env.message === parsed.data.message) return;
     await tx
       .update(envelopes)
       .set({ title: parsed.data.title, message: parsed.data.message, updatedAt: now })
@@ -360,12 +363,23 @@ export async function deliver(s: Services, mails: MailMessage[]) {
   }
 }
 
-export async function sendEnvelope(s: Services, ownerId: string, envelopeId: string, meta: RequestMeta = {}) {
+/**
+ * `placeholderTitles` are the titles a draft is created with before the sender
+ * names it (the editor passes them): sending one of them is refused.
+ */
+export async function sendEnvelope(
+  s: Services,
+  ownerId: string,
+  envelopeId: string,
+  meta: RequestMeta = {},
+  opts: { placeholderTitles?: readonly string[] } = {},
+) {
   const now = s.now();
   const mails = await s.db.transaction(async (tx) => {
     const env = await ownedEnvelopeForUpdate(tx, ownerId, envelopeId);
     requireDraft(env);
     const problems: string[] = [];
+    if (opts.placeholderTitles?.includes(env.title)) problems.push("placeholder_title");
     if (!env.documentSha256) problems.push("no_document");
     const list = await tx.select().from(recipients).where(eq(recipients.envelopeId, envelopeId));
     const actors = list.filter((r) => r.role !== "viewer");

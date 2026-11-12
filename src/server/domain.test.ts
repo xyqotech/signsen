@@ -274,6 +274,35 @@ describe("drafting an envelope", () => {
     );
   });
 
+  it("is not sent under a placeholder title when the caller names them", async () => {
+    const { u, env } = await readyEnvelope([{ name: "Moussa", email: "moussa@example.test" }]);
+    await updateEnvelope(k.s, u.id, env.id, { title: "Nouvelle demande" });
+    const placeholderTitles = ["Nouvelle demande", "New request"];
+    await expect(sendEnvelope(k.s, u.id, env.id, {}, { placeholderTitles })).rejects.toSatisfy(
+      (e) => isDomainError(e, "invalid_state") && JSON.stringify(e.details?.problems) === JSON.stringify(["placeholder_title"]),
+    );
+    expect((await getEnvelope(k.s, u.id, env.id)).status).toBe("draft");
+    expect(k.mailer.last("moussa@example.test")).toBeUndefined();
+    await updateEnvelope(k.s, u.id, env.id, { title: "Bail Mermoz" });
+    expect((await sendEnvelope(k.s, u.id, env.id, {}, { placeholderTitles })).status).toBe("in_progress");
+  });
+
+  it("records a change of title or message, and nothing when they are saved unchanged", async () => {
+    const u = await owner();
+    const env = await createEnvelope(k.s, u.id, { title: "Bail", message: "Merci." });
+    const updates = async () => (await listEvents(k.s.db, env.id)).filter((e) => e.type === "envelope.updated").length;
+    const before = await getEnvelope(k.s, u.id, env.id);
+    k.advance(60_000);
+    await updateEnvelope(k.s, u.id, env.id, { title: "  Bail ", message: "Merci." });
+    expect(await updates()).toBe(0);
+    expect((await getEnvelope(k.s, u.id, env.id)).updatedAt).toBe(before.updatedAt);
+    await updateEnvelope(k.s, u.id, env.id, { title: "Bail Mermoz", message: "Merci." });
+    await updateEnvelope(k.s, u.id, env.id, { title: "Bail Mermoz", message: "" });
+    expect(await updates()).toBe(2);
+    expect(await getEnvelope(k.s, u.id, env.id)).toMatchObject({ title: "Bail Mermoz", message: null });
+    expect((await verifyChain(k.s.db, env.id)).ok).toBe(true);
+  });
+
   it("is invisible to other accounts", async () => {
     const { env } = await readyEnvelope([{ name: "Moussa", email: "moussa@example.test" }]);
     const other = await owner("intruder@acme.test", "Intruder");

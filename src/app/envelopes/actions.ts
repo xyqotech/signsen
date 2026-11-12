@@ -15,7 +15,7 @@ import {
   updateEnvelope,
 } from "@/server/envelopes";
 import { DomainError } from "@/server/errors";
-import { getDictionary } from "@/i18n/dictionaries";
+import { getDictionary, placeholderTitles } from "@/i18n/dictionaries";
 import { actionError, currentLocale, requestMeta, requireUser, services, type ActionState } from "@/server/request";
 
 const ok: ActionState = { ok: true };
@@ -106,12 +106,26 @@ export async function saveFieldsAction(
   return ok;
 }
 
-export async function sendAction(envelopeId: string): Promise<ActionState> {
+/**
+ * The editor sends the title and the message along, as they are typed at that
+ * moment: they are saved first, so a title that was never saved on its own is
+ * not replaced by the placeholder once the envelope is frozen.
+ */
+export async function sendAction(envelopeId: string, _prev: unknown, formData: FormData): Promise<ActionState> {
   const user = await requireUser();
   try {
-    await sendEnvelope(await services(), user.id, envelopeId, await requestMeta());
+    const s = await services();
+    const meta = await requestMeta();
+    const title = formData.get("title");
+    if (typeof title === "string") {
+      await updateEnvelope(s, user.id, envelopeId, { title, message: String(formData.get("message") ?? "") }, meta);
+    }
+    await sendEnvelope(s, user.id, envelopeId, meta, { placeholderTitles });
   } catch (e) {
-    return actionError(e);
+    const state = actionError(e);
+    // Not sent, but the title and the message may have been saved: show them as they are now.
+    refresh();
+    return state;
   }
   refresh();
   return ok;

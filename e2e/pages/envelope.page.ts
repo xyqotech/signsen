@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { expect, type Page } from "@playwright/test";
 
 export type Role = "signer" | "approver" | "viewer";
+export type UploadFile = { name: string; mimeType: string; buffer: Buffer };
 
 export class EnvelopePage {
   constructor(readonly page: Page) {}
@@ -28,11 +29,38 @@ export class EnvelopePage {
     await expect(this.page.getByRole("heading", { level: 1, name: title })).toBeVisible();
   }
 
-  async upload(file: { name: string; mimeType: string; buffer: Buffer }) {
-    const replacing = await this.page.getByRole("button", { name: "Remplacer", exact: true }).isVisible();
-    await this.page.getByLabel(replacing ? "Remplacer le document" : "Choisir un PDF").setInputFiles(file);
-    await this.page.getByRole("button", { name: replacing ? "Remplacer" : "Ajouter le document", exact: true }).click();
-    await expect(this.page.getByRole("link", { name: file.name })).toBeVisible();
+  /** Types the title (and the message) and leaves the focus where it is: nothing is clicked. */
+  async typeDetails(title: string, message?: string) {
+    if (message !== undefined) await this.page.getByLabel(/Message aux destinataires/).fill(message);
+    await this.titleField().fill(title);
+  }
+
+  titleField() {
+    return this.page.getByLabel("Titre", { exact: true });
+  }
+
+  /** The file input of the document section, whatever the draft already holds. */
+  documentInput() {
+    return this.page.getByLabel(/^(Choisir un PDF|Remplacer le document)/);
+  }
+
+  /** The document attached to the draft, as shown in the document section. */
+  document(name: string) {
+    return this.page.getByRole("link", { name, exact: true });
+  }
+
+  /** Chooses a file and nothing else: choosing is what uploads it. */
+  async chooseDocument(file: UploadFile) {
+    await this.documentInput().setInputFiles(file);
+  }
+
+  /** Uploads a document; replacing the current one is confirmed. */
+  async upload(file: UploadFile) {
+    const replacing = await this.page.getByLabel(/^Remplacer le document/).isVisible();
+    if (replacing) this.page.once("dialog", (d) => d.accept());
+    await this.chooseDocument(file);
+    await expect(this.page.getByText(replacing ? "Document remplacé." : "Document ajouté.", { exact: true })).toBeVisible();
+    await expect(this.document(file.name)).toBeVisible();
   }
 
   async addRecipient(p: { name: string; email: string }, role: Role = "signer", order = 1) {
@@ -64,8 +92,17 @@ export class EnvelopePage {
     await expect(this.page.getByText("Cases enregistrées.")).toBeVisible();
   }
 
+  sendButton() {
+    return this.page.getByRole("button", { name: "Envoyer pour signature" });
+  }
+
+  /** The reasons a request was not sent. */
+  sendProblems() {
+    return this.page.getByRole("main").getByRole("alert");
+  }
+
   async send() {
-    await this.page.getByRole("button", { name: "Envoyer pour signature" }).click();
+    await this.sendButton().click();
     await expect(this.status()).toHaveText("En cours");
   }
 

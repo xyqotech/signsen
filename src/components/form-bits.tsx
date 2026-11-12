@@ -42,6 +42,9 @@ export function SubmitButton({
  * wrong one-time code would silently untick the consent box, a wrong password
  * would wipe the e-mail. Submitting through a transition avoids that reset;
  * forms that should be cleared after a success do it explicitly.
+ *
+ * The fourth value is the dispatcher itself, for a form that builds its own
+ * FormData.
  */
 export function useFormAction<S>(action: (state: S | null, formData: FormData) => Promise<S>) {
   const [state, dispatch, pending] = useActionState<S | null, FormData>(action, null);
@@ -51,7 +54,7 @@ export function useFormAction<S>(action: (state: S | null, formData: FormData) =
     const data = new FormData(e.currentTarget, submitter instanceof HTMLElement ? submitter : null);
     startTransition(() => dispatch(data));
   };
-  return [state, onSubmit, pending] as const;
+  return [state, onSubmit, pending, dispatch] as const;
 }
 
 export type FormState = {
