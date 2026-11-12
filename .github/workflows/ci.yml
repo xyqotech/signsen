@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+    # A version tag publishes a release image (see the image job).
+    tags: ["v*.*.*"]
   pull_request:
 
 permissions:
@@ -47,3 +49,89 @@ jobs:
           name: playwright-report
           path: playwright-report
           retention-days: 7
+
+  # The container image. It is built and started on every run, so a Dockerfile
+  # that no longer builds, or an image that no longer boots, fails the pull
+  # request. It is published to ghcr.io only from main and from version tags,
+  # and only after the tests above have passed.
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Only this job may write packages, and only to push the image.
+      packages: write
+    services:
+      postgres:
+        # Same pinned version as docker-compose.yml.
+        image: postgres:18.6-alpine3.24
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # main        → :main and :sha-<commit>
+          # tag v1.2.3  → :1.2.3, :1.2, :sha-<commit> and :latest
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      # linux/amd64 only for now: the standalone output embeds a native binary
+      # (sharp), so another architecture needs its own build, not a cross-build.
+      - name: Build the image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: signsen:candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Nothing is published before it has been seen running: the image must
+      # start, migrate an empty database and answer /healthz.
+      - name: Start the image and wait for /healthz
+        run: |
+          docker run -d --name signsen --network host \
+            -e DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+            -e APP_URL=http://127.0.0.1:3000 \
+            -e MAIL_TRANSPORT=console \
+            signsen:candidate
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/healthz; then exit 0; fi
+            sleep 2
+          done
+          docker logs signsen
+          exit 1
+      - name: Check the image does not run as root
+        run: test "$(docker inspect --format '{{.Config.User}}' signsen:candidate)" = "node"
+
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Same build as above, served from the cache: what is pushed is what was started.
+      - name: Publish the image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
