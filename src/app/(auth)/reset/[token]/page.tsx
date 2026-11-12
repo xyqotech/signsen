@@ -12,11 +12,12 @@ export default async function ResetPasswordPage(props: PageProps<"/reset/[token]
   const s = await services();
   const t = getDictionary(await currentLocale());
   const { token } = await props.params;
+  const linkValid = await resetLinkValid(s, token);
   return (
     <div className="mx-auto max-w-sm">
       <Card>
         <h1 className="mb-4 text-xl font-semibold">{t.auth.resetTitle}</h1>
-        {resetLinkValid(s, token) ? (
+        {linkValid ? (
           <ResetPasswordForm token={token} t={t} />
         ) : (
           <div className="space-y-4">

@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Runs the production build (`next build` with output: "standalone") without Docker.
-# Usage: PORT=3000 DATA_DIR=./data scripts/start-standalone.sh
+# Usage: DATABASE_URL=postgres://user:password@host:5432/signsen PORT=3000 DATA_DIR=./data scripts/start-standalone.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+if [ -z "${DATABASE_URL:-}" ]; then
+  echo "DATABASE_URL is required: the PostgreSQL connection string, e.g. postgres://signsen:secret@localhost:5432/signsen" >&2
+  exit 1
+fi
 
 if [ ! -f .next/standalone/server.js ]; then
   echo "No standalone build found: run 'npm run build' first." >&2

@@ -5,8 +5,8 @@ const nextConfig: NextConfig = {
   output: "standalone",
   cacheComponents: true,
   partialPrefetching: true,
-  // Node-only crypto/PDF/mail libraries stay out of the bundle (better-sqlite3 is
-  // already in Next's default list).
+  // Node-only crypto/PDF/mail libraries stay out of the bundle (pg, the PostgreSQL
+  // driver, is already in Next's default list).
   serverExternalPackages: [
     "@signpdf/signpdf",
     "@signpdf/signer-p12",

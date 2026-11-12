@@ -32,11 +32,12 @@ export default async function EnvelopePage(props: PageProps<"/envelopes/[id]">) 
   const { id } = await props.params;
   let env: EnvelopeView;
   try {
-    env = getEnvelope(s, user.id, id);
+    env = await getEnvelope(s, user.id, id);
   } catch (e) {
     if (isDomainError(e, "not_found")) notFound();
     throw e;
   }
+  const events = env.status === "draft" ? [] : await listEvents(s.db, env.id);
   return (
     <div>
       <p className="mb-2 text-sm">
@@ -45,7 +46,7 @@ export default async function EnvelopePage(props: PageProps<"/envelopes/[id]">) 
         </Link>
       </p>
       <PageTitle aside={<Badge status={env.status}>{t.status.envelope[env.status]}</Badge>}>{env.title}</PageTitle>
-      {env.status === "draft" ? <Draft env={env} t={t} /> : <Tracking env={env} t={t} locale={locale} events={listEvents(s.db, env.id)} />}
+      {env.status === "draft" ? <Draft env={env} t={t} /> : <Tracking env={env} t={t} locale={locale} events={events} />}
     </div>
   );
 }
@@ -187,7 +188,7 @@ function Tracking({
   env: EnvelopeView;
   t: Dictionary;
   locale: Locale;
-  events: ReturnType<typeof listEvents>;
+  events: Awaited<ReturnType<typeof listEvents>>;
 }) {
   const names = new Map(env.recipients.map((r) => [`recipient:${r.id}`, r.name]));
   return (

@@ -13,12 +13,13 @@ to you unless you prefer otherwise.
 | --- | --- |
 | Someone other than the recipient signs | Personal 256-bit link (only its SHA-256 is stored) **and** a 6-digit one-time code sent to the recipient's address: valid 10 min, 5 attempts, 5 codes per hour, a new code replaces the old one. |
 | A signed document is altered | SHA-256 of the original and the final PDF recorded; final PDF sealed (PKCS#7); verification refuses any byte added after sealing. |
-| The audit trail is rewritten | Events are hash-chained per request and the database refuses updates and deletions; the chain is verified before sealing. |
+| The audit trail is rewritten | Events are hash-chained per request and PostgreSQL triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` on them; the chain is verified before sealing, and its last hash is printed on the evidence certificate. |
+| Two requests at once corrupt the audit trail or act twice | Every change to a request runs in a transaction holding that request's lock, so events are appended one at a time; a unique constraint on (request, previous hash) refuses a forked chain. A double submission signs once; parallel guesses of a one-time code are counted one by one. |
 | A sender reads another sender's requests | Every read and write checks ownership and answers "not found"; `proxy.ts` returns a real 404 before rendering. |
 | Signing links leak to third parties | `Referrer-Policy: no-referrer`, `Cache-Control: no-store` on signing pages, links rotate when an invitation is resent. |
 | Password guessing | scrypt hashes, throttling per account and per IP, identical answers for unknown accounts and wrong passwords. |
 | Account takeover through "forgot password" | Single-use 256-bit link (only its SHA-256 is stored), valid 1 hour, replaced by any newer request; same answer for unknown addresses; 3 requests per address per hour; a reset closes every session and e-mails the owner. |
-| Another account on the server reads the data | `DATA_DIR` and its folders are `0700`; the database, its `-wal`/`-shm` files, documents, seal and instance key are `0600`, whatever the umask. |
+| Another account on the server reads the data | `DATA_DIR` and its folders are `0700`; documents, seal and instance key are `0600`, whatever the umask. Records are in PostgreSQL, behind its own credentials (`DATABASE_URL`); the database of the provided `docker-compose.yml` is not published on any host port. |
 | Clickjacking, MIME sniffing | `frame-ancestors 'none'`, `X-Frame-Options: DENY`, `nosniff`. |
 | CSRF | Server Actions check the request origin; session cookie is `SameSite=Lax`, `HttpOnly`, `Secure` over HTTPS. |
 
@@ -26,8 +27,12 @@ to you unless you prefer otherwise.
 
 - Serve SignSen over **HTTPS only**, behind a reverse proxy that overwrites
   `X-Forwarded-For` (the evidence file records the right-most entry).
-- **Back up `DATA_DIR`** (database, documents, seal, instance key) and keep the
-  backups encrypted: they contain personal data and signed documents.
+- **Back up the PostgreSQL database and `DATA_DIR` together** (`pg_dump` plus
+  the documents, seal and instance key — see the README) and keep the backups
+  encrypted: they contain personal data and signed documents.
+- Keep `DATABASE_URL` and `POSTGRES_PASSWORD` secret, choose a long random
+  password, and do not expose PostgreSQL to the Internet. If the database runs
+  on another host, encrypt that connection.
 - Keep `DATA_DIR` readable by the service account only. SignSen creates and
   tightens it (`0700`, files `0600`), but cannot do so on a folder it does not
   own: it then logs a warning.
@@ -41,3 +46,10 @@ to you unless you prefer otherwise.
 - The default seal certificate is self-signed; see the README to use one issued
   by a certification authority.
 - No RFC 3161 timestamp yet: the signing time comes from the server clock.
+- The append-only triggers and the hash chain protect the audit trail against
+  application bugs and partial edits. They do not stop someone who controls
+  the PostgreSQL server, or who holds the application's database credentials
+  (that role owns the tables): such a person can disable the triggers and
+  rewrite a whole chain. The copies of the sealed PDF already delivered to the
+  participants, with the chain hash printed on their certificate, are the
+  evidence such a rewrite cannot reach.

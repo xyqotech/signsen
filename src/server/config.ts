@@ -8,6 +8,10 @@ export const SUPPORTED_LOCALES: readonly Locale[] = locales;
 const schema = z.object({
   APP_URL: z.url().default("http://localhost:3000"),
   DATA_DIR: z.string().min(1).default("./data"),
+  /** PostgreSQL connection string. No default: a wrong database must never be picked silently. */
+  DATABASE_URL: z
+    .string({ error: "is required — the PostgreSQL connection string, e.g. postgres://signsen:secret@localhost:5432/signsen" })
+    .regex(/^postgres(ql)?:\/\/\S+$/, "must be a PostgreSQL connection string starting with postgres://"),
   APP_NAME: z.string().min(1).max(60).default("SignSen"),
   BRAND_COLOR: z
     .string()
@@ -32,6 +36,7 @@ const schema = z.object({
 export interface AppConfig {
   appUrl: string;
   dataDir: string;
+  databaseUrl: string;
   brand: {
     name: string;
     color: string;
@@ -73,6 +78,7 @@ export function parseConfig(env: Record<string, string | undefined>): AppConfig 
   return {
     appUrl: e.APP_URL.replace(/\/+$/, ""),
     dataDir: path.resolve(e.DATA_DIR),
+    databaseUrl: e.DATABASE_URL,
     brand: {
       name: e.APP_NAME,
       color: e.BRAND_COLOR.toLowerCase(),

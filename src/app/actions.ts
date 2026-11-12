@@ -15,7 +15,7 @@ export async function setLocaleAction(formData: FormData) {
 
 export async function signOutAction() {
   const s = await services();
-  signOut(s, (await cookies()).get(SESSION_COOKIE)?.value);
+  await signOut(s, (await cookies()).get(SESSION_COOKIE)?.value);
   await clearSessionCookie();
   redirect("/login");
 }

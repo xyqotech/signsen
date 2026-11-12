@@ -16,6 +16,13 @@ test.describe("Smoke", () => {
     expect(res.headers()["content-security-policy"]).toContain("frame-ancestors 'none'");
   });
 
+  test("the health check answers once the database is reachable, and says nothing else", async ({ request }) => {
+    const res = await request.get("/healthz");
+    expect(res.status()).toBe(200);
+    expect(await res.text()).toBe("ok\n");
+    expect(res.headers()["cache-control"]).toBe("no-store");
+  });
+
   test("a new sender signs up and lands on an empty dashboard", async ({ auth, owner, page }) => {
     await auth.signUp(owner);
     await expect(page.getByText("Aucune demande ici pour le moment.")).toBeVisible();

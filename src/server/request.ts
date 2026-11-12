@@ -13,8 +13,9 @@ export const LOCALE_COOKIE = "signsen_locale";
 
 /**
  * Entry point for every page, action and route handler. `connection()` marks the
- * render as request-time: the database is synchronous (better-sqlite3), so
- * without it Next would run queries at build time and freeze their result.
+ * render as request-time: the configuration and the database belong to the
+ * running instance, so nothing here may be evaluated (and frozen) at build time,
+ * where there is no database to connect to.
  */
 export async function services(): Promise<Services> {
   await connection();

@@ -20,12 +20,12 @@ export async function verifyAction(_prev: unknown, formData: FormData): Promise<
   const s = await services();
   try {
     const meta = await requestMeta();
-    if (!consumeRate(s.db, `verify:${meta.ip ?? "unknown"}`, 60, 3600_000, s.now())) throw new DomainError("rate_limited");
+    if (!(await consumeRate(s.db, `verify:${meta.ip ?? "unknown"}`, 60, 3600_000, s.now()))) throw new DomainError("rate_limited");
     const file = formData.get("file");
     if (!(file instanceof File) || file.size === 0) throw new DomainError("invalid_pdf");
     if (file.size > MAX_PDF_BYTES * 2) throw new DomainError("pdf_too_large");
     // Analysed in memory and forgotten: uploaded files are never stored.
-    const check = verifyUpload(s, Buffer.from(await file.arrayBuffer()));
+    const check = await verifyUpload(s, Buffer.from(await file.arrayBuffer()));
     return {
       ok: true,
       result: {

@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, count, desc, eq, inArray, like, or, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { appendEvent, type RequestMeta } from "./audit";
 import { fieldErrors } from "./auth";
 import type { Locale } from "./config";
 import { randomToken, sha256Hex } from "./crypto";
-import type { Db } from "./db/client";
+import type { Db, Tx } from "./db/client";
+import { lockEnvelope } from "./db/locks";
 import {
   envelopes,
   fields,
@@ -76,22 +77,30 @@ function invalid(error: z.ZodError): never {
 }
 
 /** Loads an envelope of this owner, or fails exactly as if it did not exist. */
-function ownedEnvelope(db: Db, ownerId: string, envelopeId: string) {
-  const row = db
+async function ownedEnvelope(db: Db, ownerId: string, envelopeId: string) {
+  const [row] = await db
     .select()
     .from(envelopes)
-    .where(and(eq(envelopes.id, envelopeId), eq(envelopes.ownerId, ownerId)))
-    .get();
+    .where(and(eq(envelopes.id, envelopeId), eq(envelopes.ownerId, ownerId)));
   if (!row) throw new DomainError("not_found");
   return row;
+}
+
+/**
+ * The same, to change it: the envelope's lock is taken first, so the state read
+ * here (draft or not, recipients, fields) cannot change under this transaction.
+ */
+async function ownedEnvelopeForUpdate(tx: Tx, ownerId: string, envelopeId: string) {
+  await lockEnvelope(tx, envelopeId);
+  return ownedEnvelope(tx, ownerId, envelopeId);
 }
 
 function requireDraft(env: { status: EnvelopeStatus }) {
   if (env.status !== "draft") throw new DomainError("invalid_state", "The envelope is no longer a draft");
 }
 
-function touch(db: Db, envelopeId: string, now: number) {
-  db.update(envelopes).set({ updatedAt: now }).where(eq(envelopes.id, envelopeId)).run();
+async function touch(tx: Tx, envelopeId: string, now: number) {
+  await tx.update(envelopes).set({ updatedAt: now }).where(eq(envelopes.id, envelopeId));
 }
 
 // ─── Drafting ────────────────────────────────────────────────────────────────
@@ -106,21 +115,21 @@ const detailsSchema = z.object({
     .transform((v) => (v ? v : null)),
 });
 
-export function createEnvelope(s: Services, ownerId: string, input: z.input<typeof detailsSchema>, meta: RequestMeta = {}) {
+export async function createEnvelope(s: Services, ownerId: string, input: z.input<typeof detailsSchema>, meta: RequestMeta = {}) {
   const parsed = detailsSchema.safeParse(input);
   if (!parsed.success) invalid(parsed.error);
   const now = s.now();
   const id = randomUUID();
-  s.db.transaction((tx) => {
-    tx.insert(envelopes)
-      .values({ id, ownerId, title: parsed.data.title, message: parsed.data.message, status: "draft", createdAt: now, updatedAt: now })
-      .run();
-    appendEvent(tx, now, { envelopeId: id, type: "envelope.created", actor: owner(ownerId), ...meta, payload: { title: parsed.data.title } });
+  await s.db.transaction(async (tx) => {
+    await tx
+      .insert(envelopes)
+      .values({ id, ownerId, title: parsed.data.title, message: parsed.data.message, status: "draft", createdAt: now, updatedAt: now });
+    await appendEvent(tx, now, { envelopeId: id, type: "envelope.created", actor: owner(ownerId), ...meta, payload: { title: parsed.data.title } });
   });
   return getEnvelope(s, ownerId, id);
 }
 
-export function updateEnvelope(
+export async function updateEnvelope(
   s: Services,
   ownerId: string,
   envelopeId: string,
@@ -130,13 +139,13 @@ export function updateEnvelope(
   const parsed = detailsSchema.safeParse(input);
   if (!parsed.success) invalid(parsed.error);
   const now = s.now();
-  s.db.transaction((tx) => {
-    requireDraft(ownedEnvelope(tx, ownerId, envelopeId));
-    tx.update(envelopes)
+  await s.db.transaction(async (tx) => {
+    requireDraft(await ownedEnvelopeForUpdate(tx, ownerId, envelopeId));
+    await tx
+      .update(envelopes)
       .set({ title: parsed.data.title, message: parsed.data.message, updatedAt: now })
-      .where(eq(envelopes.id, envelopeId))
-      .run();
-    appendEvent(tx, now, { envelopeId, type: "envelope.updated", actor: owner(ownerId), ...meta, payload: { title: parsed.data.title } });
+      .where(eq(envelopes.id, envelopeId));
+    await appendEvent(tx, now, { envelopeId, type: "envelope.updated", actor: owner(ownerId), ...meta, payload: { title: parsed.data.title } });
   });
   return getEnvelope(s, ownerId, envelopeId);
 }
@@ -148,20 +157,20 @@ export async function attachDocument(
   input: { name: string; bytes: Buffer },
   meta: RequestMeta = {},
 ) {
-  requireDraft(ownedEnvelope(s.db, ownerId, envelopeId));
+  requireDraft(await ownedEnvelope(s.db, ownerId, envelopeId));
   const info = await inspectPdf(input.bytes);
   const name = sanitizeFileName(input.name);
-  const sha256 = s.files.put(input.bytes, "application/pdf");
+  const sha256 = await s.files.put(input.bytes, "application/pdf");
   const now = s.now();
-  s.db.transaction((tx) => {
-    requireDraft(ownedEnvelope(tx, ownerId, envelopeId)); // re-checked: the await above let time pass
-    tx.update(envelopes)
+  await s.db.transaction(async (tx) => {
+    requireDraft(await ownedEnvelopeForUpdate(tx, ownerId, envelopeId)); // re-checked: the awaits above let time pass
+    await tx
+      .update(envelopes)
       .set({ documentSha256: sha256, documentName: name, pageCount: info.pageCount, updatedAt: now })
-      .where(eq(envelopes.id, envelopeId))
-      .run();
+      .where(eq(envelopes.id, envelopeId));
     // A new document invalidates fields placed on the previous one.
-    tx.delete(fields).where(eq(fields.envelopeId, envelopeId)).run();
-    appendEvent(tx, now, {
+    await tx.delete(fields).where(eq(fields.envelopeId, envelopeId));
+    await appendEvent(tx, now, {
       envelopeId,
       type: "document.attached",
       actor: owner(ownerId),
@@ -191,41 +200,39 @@ const recipientSchema = z.object({
   locale: z.enum(["fr", "en"]).optional(),
 });
 
-export function addRecipient(
+export async function addRecipient(
   s: Services,
   ownerId: string,
   envelopeId: string,
   input: z.input<typeof recipientSchema>,
   meta: RequestMeta = {},
-): RecipientView {
+): Promise<RecipientView> {
   const parsed = recipientSchema.safeParse(input);
   if (!parsed.success) invalid(parsed.error);
   const data = { ...parsed.data, email: parsed.data.email.toLowerCase() };
   const now = s.now();
   const id = randomUUID();
-  s.db.transaction((tx) => {
-    requireDraft(ownedEnvelope(tx, ownerId, envelopeId));
-    const existing = tx.select().from(recipients).where(eq(recipients.envelopeId, envelopeId)).all();
+  await s.db.transaction(async (tx) => {
+    requireDraft(await ownedEnvelopeForUpdate(tx, ownerId, envelopeId));
+    const existing = await tx.select().from(recipients).where(eq(recipients.envelopeId, envelopeId));
     if (existing.length >= MAX_RECIPIENTS) throw new DomainError("validation", "Too many recipients", { fields: { _: "too_many" } });
     if (existing.some((r) => r.email === data.email)) {
       throw new DomainError("validation", "Duplicate recipient", { fields: { email: "duplicate" } });
     }
-    const ownerLocale = tx.select({ locale: users.locale }).from(users).where(eq(users.id, ownerId)).get()?.locale;
-    tx.insert(recipients)
-      .values({
-        id,
-        envelopeId,
-        position: existing.length === 0 ? 1 : Math.max(...existing.map((r) => r.position)) + 1,
-        name: data.name,
-        email: data.email,
-        role: data.role,
-        routingOrder: data.routingOrder,
-        status: "waiting",
-        locale: data.locale ?? ownerLocale ?? s.config.defaultLocale,
-      })
-      .run();
-    touch(tx, envelopeId, now);
-    appendEvent(tx, now, {
+    const [ownerRow] = await tx.select({ locale: users.locale }).from(users).where(eq(users.id, ownerId));
+    await tx.insert(recipients).values({
+      id,
+      envelopeId,
+      position: existing.length === 0 ? 1 : Math.max(...existing.map((r) => r.position)) + 1,
+      name: data.name,
+      email: data.email,
+      role: data.role,
+      routingOrder: data.routingOrder,
+      status: "waiting",
+      locale: data.locale ?? ownerRow?.locale ?? s.config.defaultLocale,
+    });
+    await touch(tx, envelopeId, now);
+    await appendEvent(tx, now, {
       envelopeId,
       type: "recipient.added",
       actor: owner(ownerId),
@@ -233,21 +240,20 @@ export function addRecipient(
       payload: { recipientId: id, name: data.name, email: data.email, role: data.role, routingOrder: data.routingOrder },
     });
   });
-  return getEnvelope(s, ownerId, envelopeId).recipients.find((r) => r.id === id)!;
+  return (await getEnvelope(s, ownerId, envelopeId)).recipients.find((r) => r.id === id)!;
 }
 
-export function removeRecipient(s: Services, ownerId: string, envelopeId: string, recipientId: string, meta: RequestMeta = {}) {
+export async function removeRecipient(s: Services, ownerId: string, envelopeId: string, recipientId: string, meta: RequestMeta = {}) {
   const now = s.now();
-  s.db.transaction((tx) => {
-    requireDraft(ownedEnvelope(tx, ownerId, envelopeId));
-    const removed = tx
+  await s.db.transaction(async (tx) => {
+    requireDraft(await ownedEnvelopeForUpdate(tx, ownerId, envelopeId));
+    const removed = await tx
       .delete(recipients)
       .where(and(eq(recipients.id, recipientId), eq(recipients.envelopeId, envelopeId)))
-      .returning({ id: recipients.id })
-      .all();
+      .returning({ id: recipients.id });
     if (removed.length === 0) throw new DomainError("not_found");
-    touch(tx, envelopeId, now);
-    appendEvent(tx, now, { envelopeId, type: "recipient.removed", actor: owner(ownerId), ...meta, payload: { recipientId } });
+    await touch(tx, envelopeId, now);
+    await appendEvent(tx, now, { envelopeId, type: "recipient.removed", actor: owner(ownerId), ...meta, payload: { recipientId } });
   });
   return getEnvelope(s, ownerId, envelopeId);
 }
@@ -264,7 +270,7 @@ const fieldSchema = z
   .refine((f) => f.x + f.width <= 1.0001 && f.y + f.height <= 1.0001, { message: "outside_page" });
 
 /** Replaces every field of the envelope. */
-export function setFields(
+export async function setFields(
   s: Services,
   ownerId: string,
   envelopeId: string,
@@ -274,26 +280,25 @@ export function setFields(
   const parsed = z.array(fieldSchema).max(MAX_FIELDS).safeParse(input);
   if (!parsed.success) invalid(parsed.error);
   const now = s.now();
-  s.db.transaction((tx) => {
-    const env = ownedEnvelope(tx, ownerId, envelopeId);
+  await s.db.transaction(async (tx) => {
+    const env = await ownedEnvelopeForUpdate(tx, ownerId, envelopeId);
     requireDraft(env);
     if (!env.pageCount) throw new DomainError("invalid_state", "Attach a document first");
-    const signers = new Set(
-      tx
-        .select({ id: recipients.id })
-        .from(recipients)
-        .where(and(eq(recipients.envelopeId, envelopeId), eq(recipients.role, "signer")))
-        .all()
-        .map((r) => r.id),
-    );
+    const signerRows = await tx
+      .select({ id: recipients.id })
+      .from(recipients)
+      .where(and(eq(recipients.envelopeId, envelopeId), eq(recipients.role, "signer")));
+    const signers = new Set(signerRows.map((r) => r.id));
     for (const f of parsed.data) {
       if (!signers.has(f.recipientId)) throw new DomainError("validation", "Field for a non-signer", { fields: { recipientId: "not_a_signer" } });
       if (f.page > env.pageCount) throw new DomainError("validation", "Field outside the document", { fields: { page: "out_of_range" } });
     }
-    tx.delete(fields).where(eq(fields.envelopeId, envelopeId)).run();
-    for (const f of parsed.data) tx.insert(fields).values({ id: randomUUID(), envelopeId, ...f }).run();
-    touch(tx, envelopeId, now);
-    appendEvent(tx, now, { envelopeId, type: "fields.updated", actor: owner(ownerId), ...meta, payload: { count: parsed.data.length } });
+    await tx.delete(fields).where(eq(fields.envelopeId, envelopeId));
+    if (parsed.data.length > 0) {
+      await tx.insert(fields).values(parsed.data.map((f) => ({ id: randomUUID(), envelopeId, ...f })));
+    }
+    await touch(tx, envelopeId, now);
+    await appendEvent(tx, now, { envelopeId, type: "fields.updated", actor: owner(ownerId), ...meta, payload: { count: parsed.data.length } });
   });
   return getEnvelope(s, ownerId, envelopeId);
 }
@@ -306,24 +311,25 @@ export interface PendingMail {
 
 /**
  * Notifies the recipients of the current routing round. Runs inside the caller's
- * transaction and returns the invitations to send once it has committed.
- * Returns `complete: true` when no signer/approver is left to act.
+ * transaction (which holds the envelope's lock) and returns the invitations to
+ * send once it has committed. Returns `complete: true` when no signer/approver
+ * is left to act.
  */
-export function advanceRouting(tx: Db, s: Services, envelopeId: string, now: number): { mails: MailMessage[]; complete: boolean } {
-  const env = tx.select().from(envelopes).where(eq(envelopes.id, envelopeId)).get()!;
-  const all = tx.select().from(recipients).where(eq(recipients.envelopeId, envelopeId)).orderBy(asc(recipients.position)).all();
+export async function advanceRouting(tx: Tx, s: Services, envelopeId: string, now: number): Promise<{ mails: MailMessage[]; complete: boolean }> {
+  const [env] = await tx.select().from(envelopes).where(eq(envelopes.id, envelopeId));
+  const all = await tx.select().from(recipients).where(eq(recipients.envelopeId, envelopeId)).orderBy(asc(recipients.position));
   const actors = all.filter((r) => r.role !== "viewer");
   const remaining = actors.filter((r) => !ACTED.includes(r.status));
   if (remaining.length === 0) return { mails: [], complete: true };
 
   const round = Math.min(...remaining.map((r) => r.routingOrder));
-  const sender = tx.select({ name: users.name }).from(users).where(eq(users.id, env.ownerId)).get()!;
+  const [sender] = await tx.select({ name: users.name }).from(users).where(eq(users.id, env.ownerId));
   const mails: MailMessage[] = [];
   for (const r of remaining) {
     if (r.routingOrder !== round || r.status !== "waiting") continue;
     const token = randomToken();
-    tx.update(recipients).set({ status: "notified", tokenHash: sha256Hex(token) }).where(eq(recipients.id, r.id)).run();
-    appendEvent(tx, now, { envelopeId, type: "recipient.notified", actor: "system", payload: { recipientId: r.id, email: r.email } });
+    await tx.update(recipients).set({ status: "notified", tokenHash: sha256Hex(token) }).where(eq(recipients.id, r.id));
+    await appendEvent(tx, now, { envelopeId, type: "recipient.notified", actor: "system", payload: { recipientId: r.id, email: r.email } });
     mails.push(
       invitationMail({
         to: r.email,
@@ -354,28 +360,29 @@ export async function deliver(s: Services, mails: MailMessage[]) {
 
 export async function sendEnvelope(s: Services, ownerId: string, envelopeId: string, meta: RequestMeta = {}) {
   const now = s.now();
-  const mails = s.db.transaction((tx) => {
-    const env = ownedEnvelope(tx, ownerId, envelopeId);
+  const mails = await s.db.transaction(async (tx) => {
+    const env = await ownedEnvelopeForUpdate(tx, ownerId, envelopeId);
     requireDraft(env);
     const problems: string[] = [];
     if (!env.documentSha256) problems.push("no_document");
-    const list = tx.select().from(recipients).where(eq(recipients.envelopeId, envelopeId)).all();
+    const list = await tx.select().from(recipients).where(eq(recipients.envelopeId, envelopeId));
     const actors = list.filter((r) => r.role !== "viewer");
     if (actors.length === 0) problems.push("no_signer");
-    const placed = new Set(tx.select({ r: fields.recipientId }).from(fields).where(eq(fields.envelopeId, envelopeId)).all().map((f) => f.r));
+    const placedRows = await tx.select({ r: fields.recipientId }).from(fields).where(eq(fields.envelopeId, envelopeId));
+    const placed = new Set(placedRows.map((f) => f.r));
     const withoutField = list.filter((r) => r.role === "signer" && !placed.has(r.id)).map((r) => r.id);
     if (withoutField.length) problems.push("signer_without_field");
     if (problems.length) throw new DomainError("invalid_state", "Not ready to send", { problems, recipients: withoutField });
 
-    tx.update(envelopes).set({ status: "in_progress", sentAt: now, updatedAt: now }).where(eq(envelopes.id, envelopeId)).run();
-    appendEvent(tx, now, {
+    await tx.update(envelopes).set({ status: "in_progress", sentAt: now, updatedAt: now }).where(eq(envelopes.id, envelopeId));
+    await appendEvent(tx, now, {
       envelopeId,
       type: "envelope.sent",
       actor: owner(ownerId),
       ...meta,
       payload: { documentSha256: env.documentSha256, recipients: list.length },
     });
-    return advanceRouting(tx, s, envelopeId, now).mails;
+    return (await advanceRouting(tx, s, envelopeId, now)).mails;
   });
   await deliver(s, mails);
   return getEnvelope(s, ownerId, envelopeId);
@@ -384,20 +391,19 @@ export async function sendEnvelope(s: Services, ownerId: string, envelopeId: str
 /** Issues a fresh link for a recipient whose turn it is (the old link stops working). */
 export async function resendInvitation(s: Services, ownerId: string, envelopeId: string, recipientId: string, meta: RequestMeta = {}) {
   const now = s.now();
-  const mail = s.db.transaction((tx) => {
-    const env = ownedEnvelope(tx, ownerId, envelopeId);
+  const mail = await s.db.transaction(async (tx) => {
+    const env = await ownedEnvelopeForUpdate(tx, ownerId, envelopeId);
     if (env.status !== "in_progress") throw new DomainError("invalid_state");
-    const r = tx
+    const [r] = await tx
       .select()
       .from(recipients)
-      .where(and(eq(recipients.id, recipientId), eq(recipients.envelopeId, envelopeId)))
-      .get();
+      .where(and(eq(recipients.id, recipientId), eq(recipients.envelopeId, envelopeId)));
     if (!r) throw new DomainError("not_found");
     if (!ACTIVE.includes(r.status)) throw new DomainError("invalid_state", "Not this recipient's turn");
     const token = randomToken();
-    tx.update(recipients).set({ tokenHash: sha256Hex(token) }).where(eq(recipients.id, r.id)).run();
-    appendEvent(tx, now, { envelopeId, type: "recipient.notified", actor: owner(ownerId), ...meta, payload: { recipientId: r.id, email: r.email, resent: true } });
-    const sender = tx.select({ name: users.name }).from(users).where(eq(users.id, ownerId)).get()!;
+    await tx.update(recipients).set({ tokenHash: sha256Hex(token) }).where(eq(recipients.id, r.id));
+    await appendEvent(tx, now, { envelopeId, type: "recipient.notified", actor: owner(ownerId), ...meta, payload: { recipientId: r.id, email: r.email, resent: true } });
+    const [sender] = await tx.select({ name: users.name }).from(users).where(eq(users.id, ownerId));
     return invitationMail({
       to: r.email,
       locale: r.locale,
@@ -415,52 +421,51 @@ export async function resendInvitation(s: Services, ownerId: string, envelopeId:
 
 export async function cancelEnvelope(s: Services, ownerId: string, envelopeId: string, meta: RequestMeta = {}) {
   const now = s.now();
-  const mails = s.db.transaction((tx) => {
-    const env = ownedEnvelope(tx, ownerId, envelopeId);
+  const mails = await s.db.transaction(async (tx) => {
+    const env = await ownedEnvelopeForUpdate(tx, ownerId, envelopeId);
     if (env.status !== "in_progress") throw new DomainError("invalid_state");
-    tx.update(envelopes).set({ status: "cancelled", closedAt: now, updatedAt: now }).where(eq(envelopes.id, envelopeId)).run();
-    appendEvent(tx, now, { envelopeId, type: "envelope.cancelled", actor: owner(ownerId), ...meta });
-    const sender = tx.select({ name: users.name }).from(users).where(eq(users.id, ownerId)).get()!;
-    return tx
+    await tx.update(envelopes).set({ status: "cancelled", closedAt: now, updatedAt: now }).where(eq(envelopes.id, envelopeId));
+    await appendEvent(tx, now, { envelopeId, type: "envelope.cancelled", actor: owner(ownerId), ...meta });
+    const [sender] = await tx.select({ name: users.name }).from(users).where(eq(users.id, ownerId));
+    const active = await tx
       .select()
       .from(recipients)
-      .where(and(eq(recipients.envelopeId, envelopeId), inArray(recipients.status, ACTIVE)))
-      .all()
-      .map((r) =>
-        cancelledMail({ to: r.email, locale: r.locale, brand: s.config.brand, name: r.name, title: env.title, senderName: sender.name }),
-      );
+      .where(and(eq(recipients.envelopeId, envelopeId), inArray(recipients.status, ACTIVE)));
+    return active.map((r) =>
+      cancelledMail({ to: r.email, locale: r.locale, brand: s.config.brand, name: r.name, title: env.title, senderName: sender.name }),
+    );
   });
   await deliver(s, mails);
   return getEnvelope(s, ownerId, envelopeId);
 }
 
-export function deleteEnvelope(s: Services, ownerId: string, envelopeId: string, meta: RequestMeta = {}) {
+export async function deleteEnvelope(s: Services, ownerId: string, envelopeId: string, meta: RequestMeta = {}): Promise<void> {
   const now = s.now();
-  s.db.transaction((tx) => {
-    requireDraft(ownedEnvelope(tx, ownerId, envelopeId));
-    appendEvent(tx, now, { envelopeId, type: "envelope.deleted", actor: owner(ownerId), ...meta });
-    tx.delete(envelopes).where(eq(envelopes.id, envelopeId)).run();
+  await s.db.transaction(async (tx) => {
+    requireDraft(await ownedEnvelopeForUpdate(tx, ownerId, envelopeId));
+    await appendEvent(tx, now, { envelopeId, type: "envelope.deleted", actor: owner(ownerId), ...meta });
+    await tx.delete(envelopes).where(eq(envelopes.id, envelopeId));
   });
 }
 
 // ─── Reading ─────────────────────────────────────────────────────────────────
 
 /** Used by the proxy: true only when this owner owns this envelope. */
-export function ownsEnvelope(s: Services, ownerId: string, envelopeId: string): boolean {
-  return !!s.db
+export async function ownsEnvelope(s: Services, ownerId: string, envelopeId: string): Promise<boolean> {
+  const [row] = await s.db
     .select({ id: envelopes.id })
     .from(envelopes)
-    .where(and(eq(envelopes.id, envelopeId), eq(envelopes.ownerId, ownerId)))
-    .get();
+    .where(and(eq(envelopes.id, envelopeId), eq(envelopes.ownerId, ownerId)));
+  return !!row;
 }
 
-export function getEnvelope(s: Services, ownerId: string, envelopeId: string): EnvelopeView {
-  return toView(s.db, ownedEnvelope(s.db, ownerId, envelopeId));
+export async function getEnvelope(s: Services, ownerId: string, envelopeId: string): Promise<EnvelopeView> {
+  return toView(s.db, await ownedEnvelope(s.db, ownerId, envelopeId));
 }
 
-export function toView(db: Db, env: typeof envelopes.$inferSelect): EnvelopeView {
-  const recips = db.select().from(recipients).where(eq(recipients.envelopeId, env.id)).orderBy(asc(recipients.position)).all();
-  const flds = db.select().from(fields).where(eq(fields.envelopeId, env.id)).orderBy(asc(fields.page), asc(fields.y)).all();
+export async function toView(db: Db, env: typeof envelopes.$inferSelect): Promise<EnvelopeView> {
+  const recips = await db.select().from(recipients).where(eq(recipients.envelopeId, env.id)).orderBy(asc(recipients.position));
+  const flds = await db.select().from(fields).where(eq(fields.envelopeId, env.id)).orderBy(asc(fields.page), asc(fields.y));
   return {
     id: env.id,
     title: env.title,
@@ -509,38 +514,37 @@ export interface EnvelopeSummary {
   recipients: { name: string; status: RecipientStatus; role: RecipientRole }[];
 }
 
-export function listEnvelopes(s: Services, ownerId: string, q: ListQuery = {}) {
+export async function listEnvelopes(s: Services, ownerId: string, q: ListQuery = {}) {
   const pageSize = Math.min(Math.max(q.pageSize ?? 20, 1), 100);
   const page = Math.max(q.page ?? 1, 1);
   const where: SQL[] = [eq(envelopes.ownerId, ownerId)];
   if (q.status && q.status !== "all") where.push(eq(envelopes.status, q.status));
-  // LIKE wildcards are dropped from the term (drizzle's like() has no ESCAPE clause).
-  const term = q.query?.replace(/[%_]/g, "").trim();
+  // Case-insensitive search. LIKE wildcards and the escape character are dropped
+  // from the term (drizzle's ilike() has no ESCAPE clause).
+  const term = q.query?.replace(/[%_\\]/g, "").trim();
   if (term) {
     const pattern = `%${term}%`;
     const matchingRecipients = s.db
       .select({ id: recipients.envelopeId })
       .from(recipients)
-      .where(or(like(recipients.name, pattern), like(recipients.email, pattern)));
-    where.push(or(like(envelopes.title, pattern), inArray(envelopes.id, matchingRecipients))!);
+      .where(or(ilike(recipients.name, pattern), ilike(recipients.email, pattern)));
+    where.push(or(ilike(envelopes.title, pattern), inArray(envelopes.id, matchingRecipients))!);
   }
   const condition = and(...where);
-  const total = s.db.select({ n: count() }).from(envelopes).where(condition).get()!.n;
-  const rows = s.db
+  const [{ n: total }] = await s.db.select({ n: count() }).from(envelopes).where(condition);
+  const rows = await s.db
     .select()
     .from(envelopes)
     .where(condition)
     .orderBy(desc(envelopes.updatedAt), desc(envelopes.id))
     .limit(pageSize)
-    .offset((page - 1) * pageSize)
-    .all();
+    .offset((page - 1) * pageSize);
   const recips = rows.length
-    ? s.db
+    ? await s.db
         .select({ envelopeId: recipients.envelopeId, name: recipients.name, status: recipients.status, role: recipients.role })
         .from(recipients)
         .where(inArray(recipients.envelopeId, rows.map((r) => r.id)))
         .orderBy(asc(recipients.position))
-        .all()
     : [];
   const items: EnvelopeSummary[] = rows.map((r) => ({
     id: r.id,
@@ -554,8 +558,8 @@ export function listEnvelopes(s: Services, ownerId: string, q: ListQuery = {}) {
   return { items, total, page, pageSize, pages: Math.max(1, Math.ceil(total / pageSize)) };
 }
 
-export function ownerDocument(s: Services, ownerId: string, envelopeId: string, which: "original" | "final") {
-  const env = ownedEnvelope(s.db, ownerId, envelopeId);
+export async function ownerDocument(s: Services, ownerId: string, envelopeId: string, which: "original" | "final") {
+  const env = await ownedEnvelope(s.db, ownerId, envelopeId);
   const sha = which === "final" ? env.finalSha256 : env.documentSha256;
   if (!sha) throw new DomainError("not_found");
   const base = (env.documentName ?? "document.pdf").replace(/\.pdf$/i, "");

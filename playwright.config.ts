@@ -5,6 +5,18 @@ const PORT = Number(process.env.E2E_PORT ?? 3210);
 export const BASE_URL = `http://127.0.0.1:${PORT}`;
 export const E2E_DATA_DIR = path.join(__dirname, "e2e", ".data");
 
+// The same PostgreSQL server as the unit tests (a role allowed to create
+// databases); the suite gets its own database there, recreated for every run.
+const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
+if (!TEST_DATABASE_URL) {
+  throw new Error(
+    "TEST_DATABASE_URL is not set. The end-to-end tests need a PostgreSQL server, " +
+      "e.g. TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres (see CONTRIBUTING.md).",
+  );
+}
+const e2eDatabaseUrl = new URL(TEST_DATABASE_URL);
+e2eDatabaseUrl.pathname = `/signsen_e2e_${PORT}`;
+
 export default defineConfig({
   testDir: "./e2e/tests",
   fullyParallel: true,
@@ -27,8 +39,8 @@ export default defineConfig({
     { name: "mobile", use: { ...devices["Pixel 7"] }, testMatch: /ceremony|smoke/ },
   ],
   webServer: {
-    // A fresh database for every run; the production build, as deployed.
-    command: `rm -rf "${E2E_DATA_DIR}" && npm run build && scripts/start-standalone.sh`,
+    // An empty database and data directory for every run; the production build, as deployed.
+    command: `rm -rf "${E2E_DATA_DIR}" && node e2e/support/reset-database.mjs && npm run build && scripts/start-standalone.sh`,
     url: `${BASE_URL}/login`,
     timeout: 240_000,
     reuseExistingServer: false,
@@ -36,6 +48,8 @@ export default defineConfig({
     env: {
       PORT: String(PORT),
       DATA_DIR: E2E_DATA_DIR,
+      DATABASE_URL: e2eDatabaseUrl.toString(),
+      TEST_DATABASE_URL,
       APP_URL: BASE_URL,
       MAIL_TRANSPORT: "file",
       APP_NAME: "SignSen E2E",

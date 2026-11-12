@@ -1,6 +1,7 @@
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { appendEvent, listEvents, verifyChain } from "./audit";
-import { envelopes, fields, recipients, users } from "./db/schema";
+import { lockEnvelope } from "./db/locks";
+import { envelopes, events, fields, recipients, users } from "./db/schema";
 import { deliver } from "./envelopes";
 import { completedMail } from "./notifications";
 import { buildFinalPdf } from "./pdf/finalize";
@@ -24,17 +25,18 @@ export async function finalizeEnvelope(s: Services, envelopeId: string): Promise
 }
 
 async function finalize(s: Services, envelopeId: string) {
-  const env = s.db.select().from(envelopes).where(eq(envelopes.id, envelopeId)).get();
+  const [env] = await s.db.select().from(envelopes).where(eq(envelopes.id, envelopeId));
   if (!env || env.status === "completed") return "already_done" as const;
   if (env.status !== "in_progress" || !env.documentSha256 || !env.sentAt) return "not_ready" as const;
-  const list = s.db.select().from(recipients).where(eq(recipients.envelopeId, envelopeId)).orderBy(asc(recipients.position)).all();
+  const list = await s.db.select().from(recipients).where(eq(recipients.envelopeId, envelopeId)).orderBy(asc(recipients.position));
   if (list.some((r) => r.role !== "viewer" && r.status !== "signed" && r.status !== "approved")) return "not_ready" as const;
 
-  const chain = verifyChain(s.db, envelopeId);
+  const chain = await verifyChain(s.db, envelopeId);
   if (!chain.ok) throw new Error(`Audit chain of ${envelopeId} is broken at event ${chain.brokenAtEventId}; refusing to seal`);
 
-  const owner = s.db.select().from(users).where(eq(users.id, env.ownerId)).get()!;
-  const history = listEvents(s.db, envelopeId);
+  const [owner] = await s.db.select().from(users).where(eq(users.id, env.ownerId));
+  const history = await listEvents(s.db, envelopeId);
+  const placed = await s.db.select().from(fields).where(eq(fields.envelopeId, envelopeId));
   const names = new Map<string, string>([[`owner:${owner.id}`, owner.name], ["system", s.config.brand.name]]);
   for (const r of list) names.set(`recipient:${r.id}`, r.name);
 
@@ -73,31 +75,34 @@ async function finalize(s: Services, envelopeId: string) {
         signatureImage: r.signatureImage,
       };
     }),
-    fields: s.db
-      .select()
-      .from(fields)
-      .where(eq(fields.envelopeId, envelopeId))
-      .all()
-      .map((f) => ({ recipientId: f.recipientId, page: f.page, x: f.x, y: f.y, width: f.width, height: f.height })),
+    fields: placed.map((f) => ({ recipientId: f.recipientId, page: f.page, x: f.x, y: f.y, width: f.width, height: f.height })),
     events: history
       .filter((e) => !e.type.startsWith("otp."))
       .map((e) => ({ createdAt: e.createdAt, type: e.type, actorLabel: names.get(e.actor) ?? e.actor })),
     auditChainHash: chain.lastHash,
     seal: s.sealIdentity(),
   });
-  const finalSha256 = s.files.put(sealed, "application/pdf");
+  const finalSha256 = await s.files.put(sealed, "application/pdf");
 
-  const committed = s.db.transaction((tx) => {
-    const current = tx.select({ status: envelopes.status }).from(envelopes).where(eq(envelopes.id, envelopeId)).get();
+  const committed = await s.db.transaction(async (tx) => {
+    // The PDF was built outside any transaction: under the envelope's lock,
+    // make sure nothing changed meanwhile (another instance completed it, the
+    // owner cancelled it) before recording the result.
+    await lockEnvelope(tx, envelopeId);
+    const [current] = await tx.select({ status: envelopes.status }).from(envelopes).where(eq(envelopes.id, envelopeId));
     if (current?.status !== "in_progress") return false;
-    tx.update(envelopes).set({ status: "completed", finalSha256, completedAt, updatedAt: completedAt }).where(eq(envelopes.id, envelopeId)).run();
-    tx.update(recipients)
+    const [head] = await tx.select({ hash: events.hash }).from(events).where(eq(events.envelopeId, envelopeId)).orderBy(desc(events.id)).limit(1);
+    if (head?.hash !== chain.lastHash) {
+      throw new Error(`Audit chain of ${envelopeId} moved while its certificate was being built; refusing to seal`);
+    }
+    await tx.update(envelopes).set({ status: "completed", finalSha256, completedAt, updatedAt: completedAt }).where(eq(envelopes.id, envelopeId));
+    await tx
+      .update(recipients)
       .set({ status: "notified" })
-      .where(and(eq(recipients.envelopeId, envelopeId), inArray(recipients.role, ["viewer"])))
-      .run();
-    appendEvent(tx, completedAt, { envelopeId, type: "envelope.completed", actor: "system", payload: { finalSha256 } });
+      .where(and(eq(recipients.envelopeId, envelopeId), inArray(recipients.role, ["viewer"])));
+    await appendEvent(tx, completedAt, { envelopeId, type: "envelope.completed", actor: "system", payload: { finalSha256 } });
     const seal = s.sealIdentity();
-    appendEvent(tx, completedAt, {
+    await appendEvent(tx, completedAt, {
       envelopeId,
       type: "envelope.sealed",
       actor: "system",

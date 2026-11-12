@@ -24,14 +24,14 @@ export async function createEnvelopeAction() {
   const user = await requireUser();
   const s = await services();
   const t = getDictionary(await currentLocale());
-  const env = createEnvelope(s, user.id, { title: t.dashboard.untitled }, await requestMeta());
+  const env = await createEnvelope(s, user.id, { title: t.dashboard.untitled }, await requestMeta());
   redirect(`/envelopes/${env.id}`);
 }
 
 export async function updateDetailsAction(envelopeId: string, _prev: unknown, formData: FormData): Promise<ActionState> {
   const user = await requireUser();
   try {
-    updateEnvelope(
+    await updateEnvelope(
       await services(),
       user.id,
       envelopeId,
@@ -67,7 +67,7 @@ export async function uploadDocumentAction(envelopeId: string, _prev: unknown, f
 export async function addRecipientAction(envelopeId: string, _prev: unknown, formData: FormData): Promise<ActionState> {
   const user = await requireUser();
   try {
-    addRecipient(
+    await addRecipient(
       await services(),
       user.id,
       envelopeId,
@@ -88,7 +88,7 @@ export async function addRecipientAction(envelopeId: string, _prev: unknown, for
 
 export async function removeRecipientAction(envelopeId: string, recipientId: string) {
   const user = await requireUser();
-  removeRecipient(await services(), user.id, envelopeId, recipientId, await requestMeta());
+  await removeRecipient(await services(), user.id, envelopeId, recipientId, await requestMeta());
   refresh();
 }
 
@@ -98,7 +98,7 @@ export async function saveFieldsAction(
 ): Promise<ActionState> {
   const user = await requireUser();
   try {
-    setFields(await services(), user.id, envelopeId, fieldsList, await requestMeta());
+    await setFields(await services(), user.id, envelopeId, fieldsList, await requestMeta());
   } catch (e) {
     return actionError(e);
   }
@@ -131,7 +131,7 @@ export async function cancelAction(envelopeId: string): Promise<ActionState> {
 export async function deleteAction(envelopeId: string): Promise<ActionState> {
   const user = await requireUser();
   try {
-    deleteEnvelope(await services(), user.id, envelopeId, await requestMeta());
+    await deleteEnvelope(await services(), user.id, envelopeId, await requestMeta());
   } catch (e) {
     return actionError(e);
   }

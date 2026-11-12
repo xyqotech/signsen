@@ -86,6 +86,14 @@ event of the same envelope and its own hash (`hash = sha256(prev_hash ||
 canonical_json(event))`). Verification walks the chain; any edit or deletion
 breaks it. Each event records actor, IP address and user agent when known.
 
+The database enforces it:
+- triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` on `events`;
+- an event is appended inside a transaction that holds a lock on its envelope
+  (transaction-scoped advisory lock), so two concurrent writers, on any number
+  of connections, never read the same previous hash;
+- as a second barrier, `(envelope_id, prev_hash)` is unique: a chain cannot
+  fork — an event has at most one successor and an envelope one first event.
+
 ## 7. Verification
 
 A public page lets anyone drop a PDF: SignSen hashes it on the server and
@@ -109,17 +117,49 @@ address per hour. Choosing the new password (same rules as at sign-up) spends
 the link, closes every session of the account and e-mails the owner that the
 password changed. A short password does not spend the link.
 
-The data directory and its sub-folders are created `0700`; the SQLite database
-and its `-wal`/`-shm` files `0600`, whatever the process umask. Files left
-readable by others by an earlier version are tightened at start-up.
-
 ## 9. Personalisation (white label)
 
 Name, logo, primary colour, default language and support e-mail come from
 configuration. Languages: French and English in v0.1.
 
-## 10. Out of scope for v0.1 (planned)
+## 10. Storage
+
+Records live in **PostgreSQL** (accounts, sessions, envelopes, recipients,
+fields, one-time codes, audit trail, rate limits); `DATABASE_URL` is mandatory:
+without it the configuration is rejected with an explicit error, no request
+can read or write anything and the health check fails. PostgreSQL is the only
+supported database.
+
+Files live in the data directory (`DATA_DIR`): documents (content-addressed by
+SHA-256, checked on every read), the seal, the instance key and the outbox.
+The data directory and its sub-folders are created `0700` and the files in
+them `0600`, whatever the process umask; the data directory and its `files`
+folder are tightened at start-up when they were left readable by others.
+
+Rules:
+- Migrations are applied when an instance first connects to the database, one
+  instance at a time (session advisory lock), before any other query. A
+  connection that fails is retried by the next request.
+- Every change to an envelope — drafting, sending, a recipient's action,
+  completion — runs in one transaction that first takes the envelope's lock:
+  what it checks (status, turn, one-time code) is still true when it writes,
+  whatever the number of connections. A double submission acts once.
+- The rate limiter counts in a single atomic statement: concurrent requests
+  cannot exceed a limit.
+- Dates are stored as integer milliseconds since the epoch (UTC), taken from
+  the server clock.
+- `GET /healthz` answers `200` only when the configuration is valid and the
+  database answers a query, `503` otherwise, and reveals nothing else. Pages
+  stream their content, so their own status code cannot tell an operator that
+  the database is unreachable: monitoring and the container health check use
+  this address.
+
+Installations made with v0.1.0 stored their records in a SQLite file
+(`DATA_DIR/signsen.db`). That file is not read anymore and no import tool is
+provided.
+
+## 11. Out of scope for v0.1 (planned)
 
 Templates, attachments, comments, reminders and expiry, SMS/WhatsApp code
-delivery, RFC 3161 timestamps and PAdES baseline profiles, PostgreSQL,
-organisations with several members, API keys, two-factor sign-in for senders.
+delivery, RFC 3161 timestamps and PAdES baseline profiles, organisations with
+several members, API keys, two-factor sign-in for senders.

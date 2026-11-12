@@ -46,7 +46,7 @@ describe("final PDF and seal", () => {
   let input: FinalizeInput;
 
   beforeAll(async () => {
-    k = makeTestServices({ APP_NAME: "Acme Conseil" });
+    k = await makeTestServices({ APP_NAME: "Acme Conseil" });
     original = await samplePdf({ pages: 2, rotateSecond: true });
     const png = await signaturePng();
     input = {

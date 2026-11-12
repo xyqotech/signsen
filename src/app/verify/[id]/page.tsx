@@ -12,7 +12,7 @@ export default async function PublicEnvelopePage(props: PageProps<"/verify/[id]"
   const locale = await currentLocale();
   const t = getDictionary(locale);
   const { id } = await props.params;
-  const env = publicEnvelope(s, id);
+  const env = await publicEnvelope(s, id);
   return (
     <div className="mx-auto max-w-2xl space-y-4">
       <PageTitle>{t.verify.publicTitle}</PageTitle>

@@ -10,22 +10,22 @@ import { getServices } from "@/server/services";
  * not-found UI with a 200 status. The pages keep their own checks: this is an
  * extra layer, not the authorisation itself.
  */
-export function proxy(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
-  const s = getServices();
+  const s = await getServices();
 
   const signing = pathname.match(/^\/s\/([^/]+)(?:\/document)?$/);
   if (signing) {
-    return signingLinkExists(s, decodeURIComponent(signing[1])) ? NextResponse.next() : notFound(request);
+    return (await signingLinkExists(s, decodeURIComponent(signing[1]))) ? NextResponse.next() : notFound(request);
   }
 
   const owned = pathname.match(/^\/envelopes\/([0-9a-f-]{36})(\/document)?$/i);
   if (owned) {
-    const user = userForSession(s, request.cookies.get(SESSION_COOKIE)?.value);
+    const user = await userForSession(s, request.cookies.get(SESSION_COOKIE)?.value);
     if (!user) {
       return owned[2] ? new NextResponse("Unauthorized", { status: 401 }) : NextResponse.redirect(new URL("/login", request.url));
     }
-    return ownsEnvelope(s, user.id, owned[1].toLowerCase()) ? NextResponse.next() : notFound(request);
+    return (await ownsEnvelope(s, user.id, owned[1].toLowerCase())) ? NextResponse.next() : notFound(request);
   }
   return NextResponse.next();
 }

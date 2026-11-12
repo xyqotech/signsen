@@ -22,7 +22,7 @@ export default async function Dashboard(props: PageProps<"/envelopes">) {
   const status = (ENVELOPE_STATUSES as readonly string[]).includes(rawStatus ?? "") ? (rawStatus as EnvelopeStatus) : "all";
   const query = (one(sp.q) ?? "").slice(0, 100);
   const page = Math.max(1, Number.parseInt(one(sp.page) ?? "1", 10) || 1);
-  const list = listEnvelopes(s, user.id, { status, query, page, pageSize: 15 });
+  const list = await listEnvelopes(s, user.id, { status, query, page, pageSize: 15 });
 
   const href = (p: { status?: string; q?: string; page?: number }) => {
     const params = new URLSearchParams();

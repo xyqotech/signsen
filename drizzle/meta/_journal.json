@@ -1,26 +1,19 @@
 {
   "version": "7",
-  "dialect": "sqlite",
+  "dialect": "postgresql",
   "entries": [
     {
       "idx": 0,
-      "version": "6",
-      "when": 1792955537767,
+      "version": "7",
+      "when": 1794485316962,
       "tag": "0000_init",
       "breakpoints": true
     },
     {
       "idx": 1,
-      "version": "6",
-      "when": 1792955538125,
+      "version": "7",
+      "when": 1794485317338,
       "tag": "0001_events_append_only",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "6",
-      "when": 1793107662401,
-      "tag": "0002_password_resets",
       "breakpoints": true
     }
   ]

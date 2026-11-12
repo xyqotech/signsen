@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
-import type Database from "better-sqlite3";
+import type { Pool } from "pg";
 import { parseConfig, type AppConfig } from "./config";
 import { openDatabase, type Db } from "./db/client";
 import { createFileStore, privateDir, type FileStore } from "./files";
@@ -11,7 +11,8 @@ import { loadSealIdentity, type SealIdentity } from "./pdf/seal-identity";
 export interface Services {
   config: AppConfig;
   db: Db;
-  sqlite: Database.Database;
+  /** The connection pool behind `db`; closed with `pool.end()` when the services are discarded. */
+  pool: Pool;
   files: FileStore;
   mailer: Mailer;
   now: () => number;
@@ -26,21 +27,28 @@ export interface ServiceOverrides {
   now?: () => number;
 }
 
-export function createServices(config: AppConfig, overrides: ServiceOverrides = {}): Services {
+/** Prepares the data directory, connects to PostgreSQL and applies pending migrations. */
+export async function createServices(config: AppConfig, overrides: ServiceOverrides = {}): Promise<Services> {
   privateDir(config.dataDir);
   const now = overrides.now ?? (() => Date.now());
-  const { db, sqlite } = openDatabase(path.join(config.dataDir, "signsen.db"));
+  const secret = loadOrCreateSecret(path.join(config.dataDir, "instance.key"));
+  const { db, pool } = await openDatabase(config.databaseUrl);
   let seal: SealIdentity | undefined;
-  return {
-    config,
-    db,
-    sqlite,
-    files: createFileStore(db, path.join(config.dataDir, "files"), now),
-    mailer: overrides.mailer ?? createMailer(config),
-    now,
-    secret: loadOrCreateSecret(path.join(config.dataDir, "instance.key")),
-    sealIdentity: () => (seal ??= loadSealIdentity(config)),
-  };
+  try {
+    return {
+      config,
+      db,
+      pool,
+      files: createFileStore(db, path.join(config.dataDir, "files"), now),
+      mailer: overrides.mailer ?? createMailer(config),
+      now,
+      secret,
+      sealIdentity: () => (seal ??= loadSealIdentity(config)),
+    };
+  } catch (e) {
+    await pool.end(); // a start-up that fails is retried: do not leave its connections behind
+    throw e;
+  }
 }
 
 function loadOrCreateSecret(file: string): Buffer {
@@ -50,9 +58,21 @@ function loadOrCreateSecret(file: string): Buffer {
   return secret;
 }
 
-const globalForServices = globalThis as unknown as { __signsenServices?: Services };
+const globalForServices = globalThis as unknown as { __signsenServices?: Promise<Services> };
 
-/** Process-wide services built from process.env (one database connection). */
-export function getServices(): Services {
-  return (globalForServices.__signsenServices ??= createServices(parseConfig(process.env)));
+/**
+ * Process-wide services built from process.env (one connection pool). The
+ * promise is shared, so requests arriving together wait for the same start-up;
+ * a failed start-up (database unreachable, bad configuration) is not kept, and
+ * the next request tries again.
+ */
+export function getServices(): Promise<Services> {
+  return (globalForServices.__signsenServices ??= start().catch((e: unknown) => {
+    globalForServices.__signsenServices = undefined;
+    throw e;
+  }));
+}
+
+async function start(): Promise<Services> {
+  return createServices(parseConfig(process.env));
 }

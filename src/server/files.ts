@@ -7,7 +7,7 @@ import { files } from "./db/schema";
 
 export interface FileStore {
   /** Stores bytes once (content-addressed) and returns their sha256. */
-  put(bytes: Buffer, mime: string): string;
+  put(bytes: Buffer, mime: string): Promise<string>;
   /** Returns the bytes, after checking they still match their hash. */
   get(sha256: string): Buffer;
 }
@@ -42,7 +42,7 @@ export function createFileStore(db: Db, dir: string, now: () => number): FileSto
   };
 
   return {
-    put(bytes, mime) {
+    async put(bytes, mime) {
       const sha256 = sha256Hex(bytes);
       const target = locate(sha256);
       if (!fs.existsSync(target)) {
@@ -51,10 +51,7 @@ export function createFileStore(db: Db, dir: string, now: () => number): FileSto
         fs.writeFileSync(tmp, bytes, { mode: 0o600 });
         fs.renameSync(tmp, target);
       }
-      db.insert(files)
-        .values({ sha256, size: bytes.length, mime, createdAt: now() })
-        .onConflictDoNothing()
-        .run();
+      await db.insert(files).values({ sha256, size: bytes.length, mime, createdAt: now() }).onConflictDoNothing();
       return sha256;
     },
     get(sha256) {

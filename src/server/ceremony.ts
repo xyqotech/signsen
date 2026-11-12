@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNull } from "drizzle-orm";
 import { appendEvent, type RequestMeta } from "./audit";
 import { generateOtp, hmacHex, safeEqualHex, sha256Hex } from "./crypto";
-import type { Db } from "./db/client";
+import type { Db, Tx } from "./db/client";
+import { lockEnvelope } from "./db/locks";
 import { envelopes, fields, otpCodes, recipients, users, type RecipientStatus } from "./db/schema";
 import { advanceRouting, deliver, type FieldView } from "./envelopes";
 import { DomainError } from "./errors";
@@ -48,41 +49,52 @@ export interface CeremonyView {
   finalAvailable: boolean;
 }
 
-function byToken(db: Db, token: string) {
+async function byToken(db: Db, token: string) {
   if (!token || token.length > 100) throw new DomainError("not_found");
-  const r = db.select().from(recipients).where(eq(recipients.tokenHash, sha256Hex(token))).get();
+  const [r] = await db.select().from(recipients).where(eq(recipients.tokenHash, sha256Hex(token)));
   if (!r) throw new DomainError("not_found");
-  const env = db.select().from(envelopes).where(eq(envelopes.id, r.envelopeId)).get()!;
+  const [env] = await db.select().from(envelopes).where(eq(envelopes.id, r.envelopeId));
   return { r, env };
+}
+
+/**
+ * The same lookup, to act on it: once the envelope is known its lock is taken,
+ * then recipient and envelope are read again — what another request committed
+ * while this one waited (a signature, a resent link, a cancellation) is seen.
+ */
+async function byTokenForUpdate(tx: Tx, token: string) {
+  const found = await byToken(tx, token);
+  await lockEnvelope(tx, found.env.id);
+  return byToken(tx, token);
 }
 
 const actor = (recipientId: string) => `recipient:${recipientId}`;
 
 /** Cheap existence check, used by the proxy to answer a real 404 before rendering. */
-export function signingLinkExists(s: Services, token: string): boolean {
+export async function signingLinkExists(s: Services, token: string): Promise<boolean> {
   if (!token || token.length > 100) return false;
-  return !!s.db.select({ id: recipients.id }).from(recipients).where(eq(recipients.tokenHash, sha256Hex(token))).get();
+  const [row] = await s.db.select({ id: recipients.id }).from(recipients).where(eq(recipients.tokenHash, sha256Hex(token)));
+  return !!row;
 }
 
-export function openCeremony(s: Services, token: string, meta: RequestMeta = {}): CeremonyView {
+export async function openCeremony(s: Services, token: string, meta: RequestMeta = {}): Promise<CeremonyView> {
   const now = s.now();
-  return s.db.transaction((tx) => {
-    const found = byToken(tx, token);
+  return s.db.transaction(async (tx) => {
+    const found = await byTokenForUpdate(tx, token);
     const env = found.env;
     let r = found.r;
     if (env.status === "in_progress" && r.status === "notified") {
-      tx.update(recipients).set({ status: "viewed", viewedAt: now }).where(eq(recipients.id, r.id)).run();
-      appendEvent(tx, now, { envelopeId: env.id, type: "recipient.viewed", actor: actor(r.id), ...meta, payload: { recipientId: r.id } });
+      await tx.update(recipients).set({ status: "viewed", viewedAt: now }).where(eq(recipients.id, r.id));
+      await appendEvent(tx, now, { envelopeId: env.id, type: "recipient.viewed", actor: actor(r.id), ...meta, payload: { recipientId: r.id } });
       r = { ...r, status: "viewed", viewedAt: now };
     }
-    const sender = tx.select({ name: users.name, email: users.email }).from(users).where(eq(users.id, env.ownerId)).get()!;
-    const own = tx.select().from(fields).where(eq(fields.recipientId, r.id)).orderBy(asc(fields.page), asc(fields.y)).all();
-    const participants = tx
+    const [sender] = await tx.select({ name: users.name, email: users.email }).from(users).where(eq(users.id, env.ownerId));
+    const own = await tx.select().from(fields).where(eq(fields.recipientId, r.id)).orderBy(asc(fields.page), asc(fields.y));
+    const participants = await tx
       .select({ name: recipients.name, role: recipients.role, status: recipients.status })
       .from(recipients)
       .where(eq(recipients.envelopeId, env.id))
-      .orderBy(asc(recipients.position))
-      .all();
+      .orderBy(asc(recipients.position));
     return {
       envelope: {
         id: env.id,
@@ -113,8 +125,8 @@ export function openCeremony(s: Services, token: string, meta: RequestMeta = {})
 }
 
 /** The document a recipient may download: the original while open, the sealed one once completed. */
-export function ceremonyDocument(s: Services, token: string) {
-  const { env } = byToken(s.db, token);
+export async function ceremonyDocument(s: Services, token: string) {
+  const { env } = await byToken(s.db, token);
   const sha = env.status === "completed" && env.finalSha256 ? env.finalSha256 : env.documentSha256;
   if (!sha) throw new DomainError("not_found");
   const base = (env.documentName ?? "document.pdf").replace(/\.pdf$/i, "");
@@ -133,21 +145,21 @@ function requireActive(r: { status: RecipientStatus; role: string }, env: { stat
 
 export async function requestCode(s: Services, token: string, meta: RequestMeta = {}) {
   const now = s.now();
-  const mail = s.db.transaction((tx) => {
-    const { r, env } = byToken(tx, token);
+  const mail = await s.db.transaction(async (tx) => {
+    const { r, env } = await byTokenForUpdate(tx, token);
     requireActive(r, env);
-    if (!consumeRate(tx, `otp:${r.id}`, OTP_PER_HOUR, 3600_000, now)) throw new DomainError("rate_limited");
+    if (!(await consumeRate(tx, `otp:${r.id}`, OTP_PER_HOUR, 3600_000, now))) throw new DomainError("rate_limited");
     // A new code replaces any previous one.
-    tx.update(otpCodes)
+    await tx
+      .update(otpCodes)
       .set({ invalidatedAt: now })
-      .where(and(eq(otpCodes.recipientId, r.id), isNull(otpCodes.consumedAt), isNull(otpCodes.invalidatedAt)))
-      .run();
+      .where(and(eq(otpCodes.recipientId, r.id), isNull(otpCodes.consumedAt), isNull(otpCodes.invalidatedAt)));
     const code = generateOtp();
     const id = randomUUID();
-    tx.insert(otpCodes)
-      .values({ id, recipientId: r.id, codeHash: hmacHex(s.secret, `${r.id}:${code}`), createdAt: now, expiresAt: now + OTP_TTL_MS })
-      .run();
-    appendEvent(tx, now, {
+    await tx
+      .insert(otpCodes)
+      .values({ id, recipientId: r.id, codeHash: hmacHex(s.secret, `${r.id}:${code}`), createdAt: now, expiresAt: now + OTP_TTL_MS });
+    await appendEvent(tx, now, {
       envelopeId: env.id,
       type: "otp.sent",
       actor: actor(r.id),
@@ -162,15 +174,19 @@ export async function requestCode(s: Services, token: string, meta: RequestMeta 
 
 type CodeCheck = { ok: true; otpId: string } | { ok: false; code: "otp_missing" | "otp_invalid" | "otp_expired" | "otp_locked" };
 
-/** Checks (and on success consumes) the recipient's current code. Failures are counted. */
-function checkCode(tx: Db, s: Services, r: { id: string; envelopeId: string }, input: string, now: number, meta: RequestMeta): CodeCheck {
-  const current = tx
+/**
+ * Checks (and on success consumes) the recipient's current code. Failures are
+ * counted. The caller's transaction holds the envelope's lock: guesses sent in
+ * parallel are checked one after the other, so none escapes the attempt limit
+ * and a code is consumed once.
+ */
+async function checkCode(tx: Tx, s: Services, r: { id: string; envelopeId: string }, input: string, now: number, meta: RequestMeta): Promise<CodeCheck> {
+  const [current] = await tx
     .select()
     .from(otpCodes)
     .where(and(eq(otpCodes.recipientId, r.id), isNull(otpCodes.consumedAt), isNull(otpCodes.invalidatedAt)))
     .orderBy(desc(otpCodes.createdAt))
-    .limit(1)
-    .get();
+    .limit(1);
   if (!current) return { ok: false, code: "otp_missing" };
   if (current.expiresAt <= now) return { ok: false, code: "otp_expired" };
   if (current.attempts >= OTP_MAX_ATTEMPTS) return { ok: false, code: "otp_locked" };
@@ -178,11 +194,11 @@ function checkCode(tx: Db, s: Services, r: { id: string; envelopeId: string }, i
   const matches = /^\d{6}$/.test(normalised) && safeEqualHex(hmacHex(s.secret, `${r.id}:${normalised}`), current.codeHash);
   if (!matches) {
     const attempts = current.attempts + 1;
-    tx.update(otpCodes).set({ attempts }).where(eq(otpCodes.id, current.id)).run();
-    appendEvent(tx, now, { envelopeId: r.envelopeId, type: "otp.failed", actor: actor(r.id), ...meta, payload: { recipientId: r.id, otpId: current.id, attempts } });
+    await tx.update(otpCodes).set({ attempts }).where(eq(otpCodes.id, current.id));
+    await appendEvent(tx, now, { envelopeId: r.envelopeId, type: "otp.failed", actor: actor(r.id), ...meta, payload: { recipientId: r.id, otpId: current.id, attempts } });
     return { ok: false, code: attempts >= OTP_MAX_ATTEMPTS ? "otp_locked" : "otp_invalid" };
   }
-  tx.update(otpCodes).set({ consumedAt: now }).where(eq(otpCodes.id, current.id)).run();
+  await tx.update(otpCodes).set({ consumedAt: now }).where(eq(otpCodes.id, current.id));
   return { ok: true, otpId: current.id };
 }
 
@@ -200,7 +216,7 @@ export interface ActInput {
 }
 
 export async function act(s: Services, token: string, input: ActInput, meta: RequestMeta = {}) {
-  const { r: pre, env: preEnv } = byToken(s.db, token);
+  const { r: pre, env: preEnv } = await byToken(s.db, token);
   requireActive(pre, preEnv);
   // Consent and signature are checked before the code is touched: a missing tick
   // or an empty pad must never burn a valid code.
@@ -214,22 +230,22 @@ export async function act(s: Services, token: string, input: ActInput, meta: Req
   }
 
   const now = s.now();
-  const outcome = s.db.transaction((tx) => {
-    const { r, env } = byToken(tx, token);
+  const outcome = await s.db.transaction(async (tx) => {
+    const { r, env } = await byTokenForUpdate(tx, token);
     requireActive(r, env);
-    const check = checkCode(tx, s, r, input.code, now, meta);
+    const check = await checkCode(tx, s, r, input.code, now, meta);
     if (!check.ok) return { check, mails: [] as MailMessage[], complete: false, envelopeId: env.id };
     const signed = r.role === "signer";
-    tx.update(recipients)
+    await tx
+      .update(recipients)
       .set({
         status: signed ? "signed" : "approved",
         actedAt: now,
         signatureImage: signed ? input.signature!.png : null,
         signatureKind: signed ? input.signature!.kind : null,
       })
-      .where(eq(recipients.id, r.id))
-      .run();
-    appendEvent(tx, now, {
+      .where(eq(recipients.id, r.id));
+    await appendEvent(tx, now, {
       envelopeId: env.id,
       type: signed ? "recipient.signed" : "recipient.approved",
       actor: actor(r.id),
@@ -243,8 +259,8 @@ export async function act(s: Services, token: string, input: ActInput, meta: Req
         ...(signed ? { signatureKind: input.signature!.kind, signatureSha256: sha256Hex(input.signature!.png) } : {}),
       },
     });
-    tx.update(envelopes).set({ updatedAt: now }).where(eq(envelopes.id, env.id)).run();
-    const next = advanceRouting(tx, s, env.id, now);
+    await tx.update(envelopes).set({ updatedAt: now }).where(eq(envelopes.id, env.id));
+    const next = await advanceRouting(tx, s, env.id, now);
     return { check, mails: next.mails, complete: next.complete, envelopeId: env.id };
   });
 
@@ -258,30 +274,29 @@ export async function decline(s: Services, token: string, input: { code: string;
   if (reason.length < 1 || reason.length > DECLINE_REASON_MAX) {
     throw new DomainError("validation", undefined, { fields: { reason: reason ? "too_long" : "required" } });
   }
-  const { r: pre, env: preEnv } = byToken(s.db, token);
+  const { r: pre, env: preEnv } = await byToken(s.db, token);
   requireActive(pre, preEnv);
 
   const now = s.now();
-  const outcome = s.db.transaction((tx) => {
-    const { r, env } = byToken(tx, token);
+  const outcome = await s.db.transaction(async (tx) => {
+    const { r, env } = await byTokenForUpdate(tx, token);
     requireActive(r, env);
-    const check = checkCode(tx, s, r, input.code, now, meta);
+    const check = await checkCode(tx, s, r, input.code, now, meta);
     if (!check.ok) return { check, mails: [] as MailMessage[] };
-    tx.update(recipients).set({ status: "declined", actedAt: now, declineReason: reason }).where(eq(recipients.id, r.id)).run();
-    tx.update(envelopes).set({ status: "declined", closedAt: now, updatedAt: now }).where(eq(envelopes.id, env.id)).run();
-    appendEvent(tx, now, {
+    await tx.update(recipients).set({ status: "declined", actedAt: now, declineReason: reason }).where(eq(recipients.id, r.id));
+    await tx.update(envelopes).set({ status: "declined", closedAt: now, updatedAt: now }).where(eq(envelopes.id, env.id));
+    await appendEvent(tx, now, {
       envelopeId: env.id,
       type: "recipient.declined",
       actor: actor(r.id),
       ...meta,
       payload: { recipientId: r.id, method: "email_otp", otpId: check.otpId, reason },
     });
-    const ownerRow = tx.select().from(users).where(eq(users.id, env.ownerId)).get()!;
-    const others = tx
+    const [ownerRow] = await tx.select().from(users).where(eq(users.id, env.ownerId));
+    const others = await tx
       .select()
       .from(recipients)
-      .where(and(eq(recipients.envelopeId, env.id), inArray(recipients.status, ACTIVE)))
-      .all();
+      .where(and(eq(recipients.envelopeId, env.id), inArray(recipients.status, ACTIVE)));
     const mails = [
       declinedMail({ to: ownerRow.email, locale: ownerRow.locale, brand: s.config.brand, name: ownerRow.name, title: env.title, declinedBy: r.name, reason }),
       // Other participants learn the request is closed, not why: the reason is for the sender.

@@ -1,6 +1,7 @@
 import { asc, desc, eq } from "drizzle-orm";
 import { canonicalJson, sha256Hex } from "./crypto";
-import type { Db } from "./db/client";
+import type { Db, Tx } from "./db/client";
+import { lockEnvelope } from "./db/locks";
 import { events } from "./db/schema";
 
 export const GENESIS_HASH = "0".repeat(64);
@@ -55,15 +56,23 @@ function eventHash(prevHash: string, e: Required<Omit<EventInput, "ip" | "userAg
   );
 }
 
-/** Appends one event to the envelope's chain. Call inside the caller's transaction. */
-export function appendEvent(db: Db, createdAt: number, input: EventInput): { id: number; hash: string } {
-  const last = db
+/**
+ * Appends one event to the envelope's chain, inside the caller's transaction.
+ *
+ * "Read the last hash, then insert" is only safe one writer at a time: the
+ * envelope's lock is taken first and held until the transaction ends, so a
+ * concurrent writer waits and then reads the hash written here. Should that
+ * ever be bypassed, the unique (envelope_id, prev_hash) constraint refuses the
+ * second successor instead of letting the chain fork.
+ */
+export async function appendEvent(tx: Tx, createdAt: number, input: EventInput): Promise<{ id: number; hash: string }> {
+  await lockEnvelope(tx, input.envelopeId);
+  const [last] = await tx
     .select({ hash: events.hash })
     .from(events)
     .where(eq(events.envelopeId, input.envelopeId))
     .orderBy(desc(events.id))
-    .limit(1)
-    .get();
+    .limit(1);
   const prevHash = last?.hash ?? GENESIS_HASH;
   const record = {
     envelopeId: input.envelopeId,
@@ -75,19 +84,18 @@ export function appendEvent(db: Db, createdAt: number, input: EventInput): { id:
     createdAt,
   };
   const hash = eventHash(prevHash, record);
-  const row = db
+  const [row] = await tx
     .insert(events)
     .values({ ...record, payload: canonicalJson(record.payload), prevHash, hash })
-    .returning({ id: events.id })
-    .get();
+    .returning({ id: events.id });
   return { id: row.id, hash };
 }
 
 export type ChainCheck = { ok: true; count: number; lastHash: string } | { ok: false; brokenAtEventId: number };
 
 /** Recomputes every hash of the envelope's chain. */
-export function verifyChain(db: Db, envelopeId: string): ChainCheck {
-  const rows = db.select().from(events).where(eq(events.envelopeId, envelopeId)).orderBy(asc(events.id)).all();
+export async function verifyChain(db: Db, envelopeId: string): Promise<ChainCheck> {
+  const rows = await db.select().from(events).where(eq(events.envelopeId, envelopeId)).orderBy(asc(events.id));
   let prev = GENESIS_HASH;
   for (const row of rows) {
     const expected = eventHash(prev, {
@@ -105,12 +113,7 @@ export function verifyChain(db: Db, envelopeId: string): ChainCheck {
   return { ok: true, count: rows.length, lastHash: prev };
 }
 
-export function listEvents(db: Db, envelopeId: string) {
-  return db
-    .select()
-    .from(events)
-    .where(eq(events.envelopeId, envelopeId))
-    .orderBy(asc(events.id))
-    .all()
-    .map((row) => ({ ...row, payload: JSON.parse(row.payload) as Record<string, unknown> }));
+export async function listEvents(db: Db, envelopeId: string) {
+  const rows = await db.select().from(events).where(eq(events.envelopeId, envelopeId)).orderBy(asc(events.id));
+  return rows.map((row) => ({ ...row, payload: JSON.parse(row.payload) as Record<string, unknown> }));
 }

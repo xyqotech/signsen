@@ -17,7 +17,7 @@ export default async function CeremonyPage(props: PageProps<"/s/[token]">) {
   const { token } = await props.params;
   let view: CeremonyView;
   try {
-    view = openCeremony(s, token, await requestMeta());
+    view = await openCeremony(s, token, await requestMeta());
   } catch (e) {
     if (isDomainError(e, "not_found")) notFound();
     throw e;

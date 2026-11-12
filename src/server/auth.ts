@@ -44,9 +44,8 @@ export async function signUp(s: Services, input: z.input<typeof signUpSchema>): 
   const parsed = signUpSchema.safeParse(input);
   if (!parsed.success) throw new DomainError("validation", undefined, { fields: fieldErrors(parsed.error) });
   const email = parsed.data.email.toLowerCase();
-  if (s.db.select({ id: users.id }).from(users).where(eq(users.email, email)).get()) {
-    throw new DomainError("email_taken");
-  }
+  const [taken] = await s.db.select({ id: users.id }).from(users).where(eq(users.email, email));
+  if (taken) throw new DomainError("email_taken");
   const row = {
     id: randomUUID(),
     email,
@@ -55,7 +54,9 @@ export async function signUp(s: Services, input: z.input<typeof signUpSchema>): 
     locale: parsed.data.locale,
     createdAt: s.now(),
   };
-  s.db.insert(users).values(row).run();
+  // Two sign-ups racing with the same address: the unique e-mail decides, one wins.
+  const created = await s.db.insert(users).values(row).onConflictDoNothing({ target: users.email }).returning({ id: users.id });
+  if (created.length === 0) throw new DomainError("email_taken");
   return toPublic(row);
 }
 
@@ -68,11 +69,11 @@ export async function signIn(
   const now = s.now();
   const windowMs = 15 * 60 * 1000;
   const allowed =
-    consumeRate(s.db, `signin:email:${email}`, 10, windowMs, now) &&
-    (!meta.ip || consumeRate(s.db, `signin:ip:${meta.ip}`, s.config.signinIpLimit, windowMs, now));
+    (await consumeRate(s.db, `signin:email:${email}`, 10, windowMs, now)) &&
+    (!meta.ip || (await consumeRate(s.db, `signin:ip:${meta.ip}`, s.config.signinIpLimit, windowMs, now)));
   if (!allowed) throw new DomainError("rate_limited");
 
-  const user = s.db.select().from(users).where(eq(users.email, email)).get();
+  const [user] = await s.db.select().from(users).where(eq(users.email, email));
   // Same work and same answer whether the account exists or not.
   const ok = user
     ? await verifyPassword(String(input.password ?? ""), user.passwordHash)
@@ -81,10 +82,7 @@ export async function signIn(
 
   const token = randomToken();
   const expiresAt = now + SESSION_TTL_MS;
-  s.db
-    .insert(sessions)
-    .values({ id: randomUUID(), userId: user.id, tokenHash: sha256Hex(token), createdAt: now, expiresAt })
-    .run();
+  await s.db.insert(sessions).values({ id: randomUUID(), userId: user.id, tokenHash: sha256Hex(token), createdAt: now, expiresAt });
   return { user: toPublic(user), token, expiresAt };
 }
 
@@ -92,19 +90,18 @@ export async function signIn(
 let dummy: Promise<string> | undefined;
 const dummyHash = () => (dummy ??= hashPassword(randomToken()));
 
-export function userForSession(s: Services, token: string | undefined | null): PublicUser | null {
+export async function userForSession(s: Services, token: string | undefined | null): Promise<PublicUser | null> {
   if (!token) return null;
-  const row = s.db
+  const [row] = await s.db
     .select({ user: users })
     .from(sessions)
     .innerJoin(users, eq(users.id, sessions.userId))
-    .where(and(eq(sessions.tokenHash, sha256Hex(token)), gt(sessions.expiresAt, s.now())))
-    .get();
+    .where(and(eq(sessions.tokenHash, sha256Hex(token)), gt(sessions.expiresAt, s.now())));
   return row ? toPublic(row.user) : null;
 }
 
-export function signOut(s: Services, token: string | undefined | null) {
-  if (token) s.db.delete(sessions).where(eq(sessions.tokenHash, sha256Hex(token))).run();
+export async function signOut(s: Services, token: string | undefined | null): Promise<void> {
+  if (token) await s.db.delete(sessions).where(eq(sessions.tokenHash, sha256Hex(token)));
 }
 
 /**
@@ -120,57 +117,65 @@ export async function requestPasswordReset(
   const now = s.now();
   const hourMs = 3600 * 1000;
   const allowed =
-    consumeRate(s.db, `reset:email:${email}`, RESETS_PER_HOUR, hourMs, now) &&
-    (!meta.ip || consumeRate(s.db, `reset:ip:${meta.ip}`, s.config.signinIpLimit, hourMs, now));
+    (await consumeRate(s.db, `reset:email:${email}`, RESETS_PER_HOUR, hourMs, now)) &&
+    (!meta.ip || (await consumeRate(s.db, `reset:ip:${meta.ip}`, s.config.signinIpLimit, hourMs, now)));
   if (!allowed) throw new DomainError("rate_limited");
 
-  const user = s.db.select().from(users).where(eq(users.email, email)).get();
-  if (!user) return;
+  const [user] = await s.db.select().from(users).where(eq(users.email, email));
   const token = randomToken();
-  s.db.transaction((tx) => {
-    tx.delete(passwordResets).where(eq(passwordResets.userId, user.id)).run();
-    tx.insert(passwordResets)
-      .values({ id: randomUUID(), userId: user.id, tokenHash: sha256Hex(token), createdAt: now, expiresAt: now + RESET_TTL_MS })
-      .run();
+  // The same statements run for an unknown address (on an id that matches
+  // nothing), so the database round trips do not tell the two cases apart.
+  const userId = user?.id ?? randomUUID();
+  await s.db.transaction(async (tx) => {
+    // Requests for one account queue on its row: the latest link is the only one left.
+    await tx.select({ id: users.id }).from(users).where(eq(users.id, userId)).for("update");
+    await tx.delete(passwordResets).where(eq(passwordResets.userId, userId));
+    if (!user) return;
+    await tx
+      .insert(passwordResets)
+      .values({ id: randomUUID(), userId, tokenHash: sha256Hex(token), createdAt: now, expiresAt: now + RESET_TTL_MS });
   });
+  if (!user) return;
   sendInBackground(
     s,
     passwordResetMail({ to: user.email, locale: user.locale, brand: s.config.brand, name: user.name, link: `${s.config.appUrl}/reset/${token}` }),
   );
 }
 
-function findReset(s: Services, token: string | undefined | null) {
+async function findReset(s: Services, token: string | undefined | null) {
   if (!token) return undefined;
-  return s.db
+  const [reset] = await s.db
     .select()
     .from(passwordResets)
-    .where(and(eq(passwordResets.tokenHash, sha256Hex(token)), gt(passwordResets.expiresAt, s.now())))
-    .get();
+    .where(and(eq(passwordResets.tokenHash, sha256Hex(token)), gt(passwordResets.expiresAt, s.now())));
+  return reset;
 }
 
-export function resetLinkValid(s: Services, token: string | undefined | null): boolean {
-  return findReset(s, token) !== undefined;
+export async function resetLinkValid(s: Services, token: string | undefined | null): Promise<boolean> {
+  return (await findReset(s, token)) !== undefined;
 }
 
 /** Sets the new password, spends the link and closes every session of the account. */
 export async function resetPassword(s: Services, input: { token: string; password: string }): Promise<void> {
-  const reset = findReset(s, input.token);
+  const reset = await findReset(s, input.token);
   if (!reset) throw new DomainError("reset_link_invalid");
   const parsed = z.object({ password: passwordSchema }).safeParse({ password: input.password });
   if (!parsed.success) throw new DomainError("validation", undefined, { fields: fieldErrors(parsed.error) });
   const passwordHash = await hashPassword(parsed.data.password);
 
-  // Spent atomically: of two submissions racing with the same link, one wins.
-  const user = s.db.transaction((tx) => {
-    const spent = tx
+  // Spent atomically: of two submissions racing with the same link, one deletes
+  // the row and the other, once unblocked, finds nothing left to delete.
+  const user = await s.db.transaction(async (tx) => {
+    const spent = await tx
       .delete(passwordResets)
       .where(and(eq(passwordResets.id, reset.id), gt(passwordResets.expiresAt, s.now())))
-      .run();
-    if (spent.changes !== 1) return undefined;
-    tx.delete(passwordResets).where(eq(passwordResets.userId, reset.userId)).run();
-    tx.update(users).set({ passwordHash }).where(eq(users.id, reset.userId)).run();
-    tx.delete(sessions).where(eq(sessions.userId, reset.userId)).run();
-    return tx.select().from(users).where(eq(users.id, reset.userId)).get();
+      .returning({ id: passwordResets.id });
+    if (spent.length !== 1) return undefined;
+    await tx.delete(passwordResets).where(eq(passwordResets.userId, reset.userId));
+    await tx.update(users).set({ passwordHash }).where(eq(users.id, reset.userId));
+    await tx.delete(sessions).where(eq(sessions.userId, reset.userId));
+    const [row] = await tx.select().from(users).where(eq(users.id, reset.userId));
+    return row;
   });
   if (!user) throw new DomainError("reset_link_invalid");
   sendInBackground(

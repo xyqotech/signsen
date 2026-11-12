@@ -7,7 +7,7 @@ export async function GET(request: Request, ctx: RouteContext<"/s/[token]/docume
   const s = await services();
   const { token } = await ctx.params;
   try {
-    const doc = ceremonyDocument(s, token);
+    const doc = await ceremonyDocument(s, token);
     return pdfResponse(doc.bytes, doc.fileName, new URL(request.url).searchParams.has("download"));
   } catch (e) {
     if (isDomainError(e, "not_found")) return new Response("Not found", { status: 404 });

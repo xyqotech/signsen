@@ -21,15 +21,14 @@ export function maskEmail(email: string): string {
 }
 
 /** What anyone holding the QR code (an unguessable id) may learn about a completed envelope. */
-export function publicEnvelope(s: Services, envelopeId: string): PublicEnvelope | null {
+export async function publicEnvelope(s: Services, envelopeId: string): Promise<PublicEnvelope | null> {
   if (!/^[0-9a-f-]{36}$/i.test(envelopeId)) return null;
-  const env = s.db
+  const [env] = await s.db
     .select()
     .from(envelopes)
-    .where(and(eq(envelopes.id, envelopeId), eq(envelopes.status, "completed")))
-    .get();
+    .where(and(eq(envelopes.id, envelopeId), eq(envelopes.status, "completed")));
   if (!env || !env.finalSha256 || !env.completedAt) return null;
-  const list = s.db.select().from(recipients).where(eq(recipients.envelopeId, env.id)).orderBy(asc(recipients.position)).all();
+  const list = await s.db.select().from(recipients).where(eq(recipients.envelopeId, env.id)).orderBy(asc(recipients.position));
   return {
     id: env.id,
     title: env.title,
@@ -48,17 +47,16 @@ export interface UploadVerification {
   sealedByThisInstance: boolean;
 }
 
-export function verifyUpload(s: Services, bytes: Buffer): UploadVerification {
+export async function verifyUpload(s: Services, bytes: Buffer): Promise<UploadVerification> {
   const sha256 = sha256Hex(bytes);
-  const match = s.db
+  const [match] = await s.db
     .select({ id: envelopes.id })
     .from(envelopes)
-    .where(and(eq(envelopes.finalSha256, sha256), eq(envelopes.status, "completed")))
-    .get();
+    .where(and(eq(envelopes.finalSha256, sha256), eq(envelopes.status, "completed")));
   const seal = verifySeal(bytes);
   return {
     sha256,
-    envelope: match ? publicEnvelope(s, match.id) : null,
+    envelope: match ? await publicEnvelope(s, match.id) : null,
     seal,
     sealedByThisInstance: seal.valid && seal.certificateFingerprint === s.sealIdentity().fingerprint,
   };
