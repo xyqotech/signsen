@@ -603,20 +603,57 @@ describe("declining and cancelling", () => {
     const final = await getEnvelope(k.s, u.id, env.id);
     const types = (await listEvents(k.s.db, env.id)).map((e) => e.type);
     if (final.status === "cancelled") {
-      // The cancellation was recorded before the seal: nothing is sealed, nothing is sent as final.
+      // The cancellation came first: the signature that followed was refused,
+      // nothing is sealed, nothing is sent as final.
       expect(cancelling.status).toBe("fulfilled");
+      expect(failures([signing])).toEqual(["invalid_state"]);
+      expect(types).not.toContain("recipient.signed");
       expect(final.finalSha256).toBeNull();
       expect(types).not.toContain("envelope.completed");
       expect(types).not.toContain("envelope.sealed");
       expect(k.mailer.to("awa@acme.test").filter((m) => /Terminé/.test(m.subject))).toHaveLength(0);
-      // A signature that arrived after the cancellation was refused.
-      if (signing.status === "rejected") expect(types).not.toContain("recipient.signed");
     } else {
       expect(final.status).toBe("completed");
       expect(signing.status).toBe("fulfilled");
       expect(failures([cancelling])).toEqual(["invalid_state"]);
       expect(types).not.toContain("envelope.cancelled");
     }
+    expect((await verifyChain(k.s.db, env.id)).ok).toBe(true);
+  });
+
+  it("refuses to cancel once everyone has signed, and resumes a seal that failed", async () => {
+    const { u, env } = await readyEnvelope([{ name: "Moussa", email: "moussa@example.test" }]);
+    await sendEnvelope(k.s, u.id, env.id);
+    const token = linkFor("moussa@example.test");
+    await requestCode(k.s, token);
+    const code = codeFor("moussa@example.test");
+    const sig = await signature();
+    const sealIdentity = k.s.sealIdentity;
+    try {
+      // The seal fails right after the last signature: signed by everyone, still in progress.
+      k.s.sealIdentity = () => {
+        throw new Error("seal unavailable");
+      };
+      await expect(act(k.s, token, { code, consent: true, signature: sig })).rejects.toThrow("seal unavailable");
+      expect(await getEnvelope(k.s, u.id, env.id)).toMatchObject({ status: "in_progress" });
+
+      // The sender can no longer withdraw it, even while the seal keeps failing.
+      await expectCode(cancelEnvelope(k.s, u.id, env.id), "invalid_state");
+      expect(await getEnvelope(k.s, u.id, env.id)).toMatchObject({ status: "in_progress", finalSha256: null });
+    } finally {
+      k.s.sealIdentity = sealIdentity;
+    }
+
+    // Seal available again: the refused cancellation is what resumes it.
+    await expectCode(cancelEnvelope(k.s, u.id, env.id), "invalid_state");
+    const final = await getEnvelope(k.s, u.id, env.id);
+    expect(final.status).toBe("completed");
+    expect(final.finalSha256).not.toBeNull();
+    const types = (await listEvents(k.s.db, env.id)).map((e) => e.type);
+    expect(types).toContain("recipient.signed");
+    expect(types).toContain("envelope.sealed");
+    expect(types).not.toContain("envelope.cancelled");
+    expect(k.mailer.to("moussa@example.test").filter((m) => /Annulé/.test(m.subject))).toHaveLength(0);
     expect((await verifyChain(k.s.db, env.id)).ok).toBe(true);
   });
 

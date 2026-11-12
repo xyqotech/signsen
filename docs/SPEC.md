@@ -49,6 +49,10 @@ Rules:
 - Only the owner of an envelope can see it in the dashboard, send, cancel or
   delete it.
 - A declined or cancelled envelope is final: nobody can act on it anymore.
+- The owner can cancel only while a signer or an approver still has to act.
+  Once the last of them has acted the envelope is signed: cancelling is refused,
+  even during the short time the final PDF is being sealed. If that seal failed,
+  the refused cancellation tries it again.
 
 ## 4. Ceremony (recipient side, no account needed)
 

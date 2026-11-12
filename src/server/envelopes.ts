@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, count, desc, eq, ilike, inArray, or, type SQL } from "drizzle-orm";
+import { and, asc, count, desc, eq, ilike, inArray, ne, notInArray, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { appendEvent, type RequestMeta } from "./audit";
 import { fieldErrors } from "./auth";
@@ -69,6 +69,8 @@ export interface EnvelopeView {
 
 const ACTED: RecipientStatus[] = ["signed", "approved", "declined"];
 const ACTIVE: RecipientStatus[] = ["notified", "viewed"];
+/** What a signer or an approver ends on when the request goes through: the rule of the seal. */
+const DONE: RecipientStatus[] = ["signed", "approved"];
 
 const owner = (id: string) => `owner:${id}`;
 
@@ -424,6 +426,14 @@ export async function cancelEnvelope(s: Services, ownerId: string, envelopeId: s
   const mails = await s.db.transaction(async (tx) => {
     const env = await ownedEnvelopeForUpdate(tx, ownerId, envelopeId);
     if (env.status !== "in_progress") throw new DomainError("invalid_state");
+    // Once every signer and approver has acted the request is signed: it is
+    // about to be sealed, and its sender can no longer withdraw it.
+    const [pending] = await tx
+      .select({ id: recipients.id })
+      .from(recipients)
+      .where(and(eq(recipients.envelopeId, envelopeId), ne(recipients.role, "viewer"), notInArray(recipients.status, DONE)))
+      .limit(1);
+    if (!pending) return null;
     await tx.update(envelopes).set({ status: "cancelled", closedAt: now, updatedAt: now }).where(eq(envelopes.id, envelopeId));
     await appendEvent(tx, now, { envelopeId, type: "envelope.cancelled", actor: owner(ownerId), ...meta });
     const [sender] = await tx.select({ name: users.name }).from(users).where(eq(users.id, ownerId));
@@ -435,8 +445,28 @@ export async function cancelEnvelope(s: Services, ownerId: string, envelopeId: s
       cancelledMail({ to: r.email, locale: r.locale, brand: s.config.brand, name: r.name, title: env.title, senderName: sender.name }),
     );
   });
+  if (mails === null) {
+    await resumeSealing(s, envelopeId);
+    throw new DomainError("invalid_state", "Everyone has signed: the request can no longer be cancelled");
+  }
   await deliver(s, mails);
   return getEnvelope(s, ownerId, envelopeId);
+}
+
+/**
+ * A request signed by everyone but still in progress is being sealed, or its
+ * seal failed after the last signature. Since it can no longer be cancelled,
+ * the refused cancellation tries the seal again: that is its way out. A seal
+ * that fails again is logged, and the cancellation stays refused.
+ */
+async function resumeSealing(s: Services, envelopeId: string): Promise<void> {
+  try {
+    // Loaded on demand: completion.ts imports this module.
+    const { finalizeEnvelope } = await import("./completion");
+    await finalizeEnvelope(s, envelopeId);
+  } catch (e) {
+    console.error(`[envelopes] sealing ${envelopeId} failed again: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 export async function deleteEnvelope(s: Services, ownerId: string, envelopeId: string, meta: RequestMeta = {}): Promise<void> {
