@@ -87,6 +87,7 @@ const fr = {
     otp_expired: "Ce code a expiré. Demandez-en un nouveau.",
     otp_locked: "Trop d'essais avec ce code. Demandez-en un nouveau.",
     problems: {
+      placeholder_title: "Donnez un titre à la demande : c'est lui que verront vos destinataires.",
       no_document: "Ajoutez un document PDF.",
       no_signer: "Ajoutez au moins un signataire ou un approbateur.",
       signer_without_field: "Chaque signataire doit avoir au moins une case de signature.",
@@ -129,12 +130,16 @@ const fr = {
     review: "5. Envoi",
     title: "Titre",
     message: "Message aux destinataires (facultatif)",
+    saving: "Enregistrement…",
+    saved: "Enregistré.",
     upload: "Choisir un PDF",
-    uploadSubmit: "Ajouter le document",
-    replaceSubmit: "Remplacer",
     uploadHint: "PDF non protégé, 20 Mo maximum.",
     replace: "Remplacer le document",
     replaceWarning: "Remplacer le document efface les cases déjà placées.",
+    replaceConfirm: "Remplacer le document ? Les cases de signature déjà placées seront effacées.",
+    uploading: "Envoi du document en cours…",
+    documentAdded: "Document ajouté.",
+    documentReplaced: "Document remplacé.",
     pages: "pages",
     addRecipient: "Ajouter",
     role: "Rôle",
@@ -349,6 +354,7 @@ const en: Dictionary = {
     otp_expired: "This code has expired. Request a new one.",
     otp_locked: "Too many attempts with this code. Request a new one.",
     problems: {
+      placeholder_title: "Give the request a title: it is what your recipients will see.",
       no_document: "Add a PDF document.",
       no_signer: "Add at least one signer or approver.",
       signer_without_field: "Every signer needs at least one signature box.",
@@ -385,12 +391,16 @@ const en: Dictionary = {
     review: "5. Send",
     title: "Title",
     message: "Message to recipients (optional)",
+    saving: "Saving…",
+    saved: "Saved.",
     upload: "Choose a PDF",
-    uploadSubmit: "Add the document",
-    replaceSubmit: "Replace",
     uploadHint: "Unprotected PDF, 20 MB maximum.",
     replace: "Replace the document",
     replaceWarning: "Replacing the document removes the boxes already placed.",
+    replaceConfirm: "Replace the document? The signature boxes already placed will be removed.",
+    uploading: "Uploading the document…",
+    documentAdded: "Document added.",
+    documentReplaced: "Document replaced.",
     pages: "pages",
     addRecipient: "Add",
     role: "Role",
@@ -519,6 +529,9 @@ const en: Dictionary = {
 };
 
 const dictionaries: Record<Locale, Dictionary> = { fr, en };
+
+/** The title a new draft gets in each language, until the sender gives it one. */
+export const placeholderTitles: readonly string[] = Object.values(dictionaries).map((d) => d.dashboard.untitled);
 
 export function getDictionary(locale: Locale): Dictionary {
   return dictionaries[locale] ?? fr;

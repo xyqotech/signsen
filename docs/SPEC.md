@@ -45,7 +45,11 @@ then become `notified`.
 Rules:
 - An envelope can be sent only if it has a document, at least one signer or
   approver, and every signer has at least one field.
-- Once sent, document, recipients and fields are frozen.
+- From the editor, it also needs a title of its own: the placeholder title a new
+  draft is created with ("Nouvelle demande" / "New request") is refused. The
+  title is what recipients read on the signing page, in their e-mails and in the
+  evidence certificate, and it cannot be changed after sending.
+- Once sent, title, message, document, recipients and fields are frozen.
 - Only the owner of an envelope can see it in the dashboard, send, cancel or
   delete it.
 - A declined or cancelled envelope is final: nobody can act on it anymore.
@@ -53,6 +57,24 @@ Rules:
   Once the last of them has acted the envelope is signed: cancelling is refused,
   even during the short time the final PDF is being sealed. If that seal failed,
   the refused cancellation tries it again.
+
+### Draft editor: nothing typed or chosen is lost in silence
+
+- **Document.** Choosing a PDF uploads it at once: there is no second button to
+  click. The upload in progress and its result (document added, or the reason it
+  was refused) are announced. When the draft already has a document, choosing
+  another one asks for confirmation first, because replacing a document removes
+  the boxes placed on it; declining changes nothing. A file chosen before the
+  page's scripts are loaded is uploaded as soon as they are.
+- **Title and message.** They are saved when a field loses focus, when Enter is
+  pressed in the title, and with the Save button; "Saved" is announced. An
+  empty title is not saved.
+- **Sending.** "Send for signature" carries the title and the message as they
+  are typed at that moment: they are saved first, then the envelope is sent. If
+  they are invalid nothing is sent.
+- Saving a title and a message that change nothing records no event.
+- The editor, like the rest of the application, needs JavaScript: there is no
+  script-less fallback.
 
 ## 4. Ceremony (recipient side, no account needed)
 

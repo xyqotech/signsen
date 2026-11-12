@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ActionForm } from "@/components/action-form";
+import { DocumentUpload } from "@/components/document-upload";
+import { DetailsForm, DraftScope, SendForm } from "@/components/draft-details";
 import { FieldEditor } from "@/components/field-editor";
 import { SubmitButton } from "@/components/form-bits";
 import { Badge, buttonClass, Card, inputClass, Label, PageTitle } from "@/components/ui";
@@ -55,20 +57,11 @@ function Draft({ env, t }: { env: EnvelopeView; t: Dictionary }) {
   const signers = env.recipients.filter((r) => r.role === "signer");
   const docUrl = `/envelopes/${env.id}/document`;
   return (
+    <DraftScope>
     <div className="space-y-6">
       <Card>
         <h2 className="mb-3 font-semibold">{t.editor.details}</h2>
-        <ActionForm action={updateDetailsAction.bind(null, env.id)} errors={t.errors} successMessage="✓">
-          <div>
-            <Label htmlFor="title">{t.editor.title}</Label>
-            <input id="title" name="title" defaultValue={env.title} required maxLength={200} className={inputClass} />
-          </div>
-          <div>
-            <Label htmlFor="message">{t.editor.message}</Label>
-            <textarea id="message" name="message" defaultValue={env.message ?? ""} maxLength={2000} rows={3} className={inputClass} />
-          </div>
-          <SubmitButton variant="secondary">{t.common.save}</SubmitButton>
-        </ActionForm>
+        <DetailsForm action={updateDetailsAction.bind(null, env.id)} title={env.title} message={env.message ?? ""} t={t} />
       </Card>
 
       <Card>
@@ -83,15 +76,7 @@ function Draft({ env, t }: { env: EnvelopeView; t: Dictionary }) {
             </span>
           </p>
         ) : null}
-        <ActionForm action={uploadDocumentAction.bind(null, env.id)} errors={t.errors} resetOnSuccess>
-          <div>
-            <Label htmlFor="document" hint={env.documentName ? t.editor.replaceWarning : t.editor.uploadHint}>
-              {env.documentName ? t.editor.replace : t.editor.upload}
-            </Label>
-            <input id="document" name="document" type="file" accept="application/pdf,.pdf" required className="block text-sm" />
-          </div>
-          <SubmitButton variant="secondary">{env.documentName ? t.editor.replaceSubmit : t.editor.uploadSubmit}</SubmitButton>
-        </ActionForm>
+        <DocumentUpload action={uploadDocumentAction.bind(null, env.id)} current={env.documentName} t={t} />
       </Card>
 
       <Card>
@@ -167,15 +152,16 @@ function Draft({ env, t }: { env: EnvelopeView; t: Dictionary }) {
         <h2 className="mb-1 font-semibold">{t.editor.review}</h2>
         <p className="mb-3 text-sm text-muted">{t.editor.sendHint}</p>
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <ActionForm action={sendAction.bind(null, env.id)} errors={t.errors}>
+          <SendForm action={sendAction.bind(null, env.id)} errors={t.errors}>
             <SubmitButton>{t.editor.send}</SubmitButton>
-          </ActionForm>
+          </SendForm>
           <ActionForm action={deleteAction.bind(null, env.id)} errors={t.errors} confirmMessage={t.editor.deleteConfirm}>
             <SubmitButton variant="danger">{t.editor.deleteDraft}</SubmitButton>
           </ActionForm>
         </div>
       </Card>
     </div>
+    </DraftScope>
   );
 }
 
