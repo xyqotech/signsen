@@ -65,6 +65,25 @@ reaches its database, `503` otherwise: point your monitoring at it (the
 container health check does). Pages stream their content, so their own status
 code stays `200` even when the database is down.
 
+### Published image
+
+Every commit on `main` that passes the tests is built, started once against an
+empty database, and only then published to
+[`ghcr.io/xyqotech/signsen`](https://github.com/xyqotech/signsen/pkgs/container/signsen)
+(`linux/amd64`):
+
+| Tag | Points to |
+| --- | --- |
+| `sha-<commit>` | exactly that commit — the tag to deploy |
+| `main` | the latest commit on `main` — moves at every merge |
+| `1.2.3`, `1.2`, `latest` | a release, once a `v1.2.3` tag is pushed |
+
+To run the published image instead of building it, replace the `build:` and
+`image:` lines of the `signsen` service in `docker-compose.yml` with a pinned
+tag: `image: ghcr.io/xyqotech/signsen:sha-<commit>`. Deploy a `sha-` or version tag,
+never `main` or `latest`: a tag that moves makes two servers started on
+different days run different code.
+
 ### Where the state lives, and how to back it up
 
 | What | Where |
@@ -233,6 +252,11 @@ PostgreSQL (version épinglée, inaccessible hors du réseau compose). Tant que 
 mot de passe est vide, la base refuse de s'initialiser (`docker compose logs
 db` l'indique) et SignSen ne démarre pas. Placez un reverse proxy (TLS) devant
 le port 3000.
+
+**Image publiée** : chaque commit de `main` qui passe les tests est construit,
+démarré une fois sur une base vide, puis publié sur `ghcr.io/xyqotech/signsen`
+(`linux/amd64`). Déployez une étiquette `sha-<commit>` ou de version, jamais
+`main` ni `latest`, qui changent de contenu d'un jour à l'autre.
 
 **Stockage et sauvegarde** : les comptes, demandes, destinataires et le journal
 d'audit sont dans PostgreSQL (volume `signsen-db`) ; les documents, le sceau et
